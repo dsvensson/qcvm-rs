@@ -65,6 +65,11 @@ pub enum DumpKind {
 /// the VM self-contained: printing goes nowhere, cvars read as unset, clocks come from the
 /// operating system. Host-specific builtins receive `&mut Self` alongside the VM, which is where
 /// their state lives.
+///
+/// Host methods and builtins ([`BuiltinFn`](crate::BuiltinFn)) must not panic. A panic that
+/// unwinds through QuakeC execution reaches the caller of [`Vm::call`] unchanged, but leaves the
+/// VM poisoned: every later call fails with [`ErrorKind::Poisoned`](crate::ErrorKind::Poisoned)
+/// until [`Vm::reset`]. Report failures as errors instead.
 pub trait Host: Sized {
     /// A non-fatal problem in QuakeC (bad entity, bad string reference, …). Default: ignored.
     fn warning(&mut self, warning: &Warning) {
@@ -210,8 +215,17 @@ pub trait Host: Sized {
         let _ = line;
     }
 
-    /// Called after `spawn` (from QuakeC or the host) allocated an entity. Default: nothing.
+    /// Called after QuakeC's `spawn` builtin allocated an entity (not for [`Vm::spawn`]: the
+    /// host knows about those). Default: nothing.
     fn on_spawn(&mut self, vm: &mut Vm<Self>, e: crate::value::EntRef) {
+        let _ = (vm, e);
+    }
+
+    /// Called before QuakeC's `remove` or `removeinstant` (or `objerror`) frees an entity, while
+    /// its fields are still intact; only for removals that go ahead (not for the world, a free
+    /// or a protected entity), and not for [`Vm::remove`]. [`Vm::serial`] tells a freed slot's
+    /// next occupant apart without this hook. Default: nothing.
+    fn on_remove(&mut self, vm: &mut Vm<Self>, e: crate::value::EntRef) {
         let _ = (vm, e);
     }
 }

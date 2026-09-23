@@ -916,3 +916,56 @@ fn deadline_stops_long_calls() {
         "{took:?}"
     );
 }
+
+#[derive(Default)]
+struct Hooks {
+    spawned: Vec<(u32, u32)>,
+    removed: Vec<(u32, f32)>,
+}
+
+impl qcvm::Host for Hooks {
+    fn on_spawn(&mut self, vm: &mut Vm<Self>, e: EntRef) {
+        self.spawned.push((e.0, vm.serial(e).unwrap()));
+    }
+    fn on_remove(&mut self, vm: &mut Vm<Self>, e: EntRef) {
+        let health = vm.field::<f32>("health").unwrap();
+        self.removed.push((e.0, vm.get_field(e, health).unwrap()));
+    }
+}
+
+/// `on_spawn` and `on_remove` fire for QuakeC's `spawn` and `remove` (with the fields still
+/// intact), not for the host's own `Vm::spawn`/`Vm::remove`, and not for refused removals.
+#[test]
+fn spawn_and_remove_hooks() {
+    let mut asm = Asm::new();
+    let (_, health) = asm.field("health", ty::FLOAT);
+    let spawn = asm.builtin("spawn", 14, 0);
+    let remove = asm.builtin("remove", 15, 1);
+    let (spawn_g, remove_g) = (
+        asm.global("spawn_g", ty::FUNCTION, &[spawn]),
+        asm.global("remove_g", ty::FUNCTION, &[remove]),
+    );
+    let seven = asm.float(7.0);
+    let f = asm.function("churn", &[], 2);
+    let (e, p) = (f.local(0), f.local(1));
+    asm.emit(Op::Call0, spawn_g, 0, 0);
+    asm.emit(Op::StoreEnt, OFS_RETURN, e, 0);
+    asm.emit(Op::Address, e, health, p);
+    asm.emit(Op::StorePF, seven, p, 0);
+    asm.emit(Op::StoreEnt, e, parm(0), 0);
+    asm.emit(Op::Call1, remove_g, 0, 0);
+    asm.emit(Op::StoreEnt, e, parm(0), 0);
+    asm.emit(Op::Call1, remove_g, 0, 0); // already free: refused
+    asm.emit(Op::Done, 0, 0, 0);
+    let program = Arc::new(Program::parse(&asm.build(ProgsFormat::Fte16)).unwrap());
+    let mut vm: Vm<Hooks> =
+        Vm::new(program, Arc::new(Builtins::standard(Numbering::Csqc)), VmConfig::default())
+            .unwrap();
+    let mut host = Hooks::default();
+    let own = vm.spawn().unwrap();
+    let churn = vm.find_function("churn").unwrap();
+    vm.call(&mut host, churn, &[]).unwrap();
+    vm.remove(own, true);
+    assert_eq!(host.spawned, [(2, 1)]);
+    assert_eq!(host.removed, [(2, 7.0)]);
+}

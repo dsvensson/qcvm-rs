@@ -174,17 +174,26 @@ pub fn spawn<H: Host>(vm: &mut Vm<H>, host: &mut H) -> Result<(), VmError> {
 
 /// `void remove(entity e)`: frees an entity (the world, free and protected entities are refused
 /// with a warning). Its slot is not reused for half a second.
-pub fn remove<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
+pub fn remove<H: Host>(vm: &mut Vm<H>, host: &mut H) -> Result<(), VmError> {
     let e = ent_arg(vm, 0);
-    vm.remove(EntRef(e), false);
+    remove_entity(vm, host, EntRef(e), false);
     Ok(())
 }
 
 /// `void removeinstant(entity e)`: like `remove`, but the slot may be reused at once.
-pub fn removeinstant<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
+pub fn removeinstant<H: Host>(vm: &mut Vm<H>, host: &mut H) -> Result<(), VmError> {
     let e = ent_arg(vm, 0);
-    vm.remove(EntRef(e), true);
+    remove_entity(vm, host, EntRef(e), true);
     Ok(())
+}
+
+/// Frees `e` for QuakeC, first telling the host ([`Host::on_remove`]) if the removal will go
+/// ahead (`Vm::remove` refuses the world, free and protected entities, with a warning).
+pub(crate) fn remove_entity<H: Host>(vm: &mut Vm<H>, host: &mut H, e: EntRef, instant: bool) {
+    if e.0 != 0 && vm.is_in_use(e) && !vm.is_protected(e) {
+        host.on_remove(vm, e);
+    }
+    vm.remove(e, instant);
 }
 
 // ---- iteration and search ---------------------------------------------------------------------

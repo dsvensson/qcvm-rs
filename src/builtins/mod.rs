@@ -18,6 +18,12 @@ use crate::vm::Vm;
 ///
 /// It reads its arguments from the VM (`vm.arg_*`), writes its result (`vm.ret_*`) and may call
 /// back into QuakeC with `vm.call`. Host state lives in `H`.
+///
+/// A builtin reports failure by returning an error: [`VmError::builtin`] for FTE's builtin
+/// errors (warnings in developer mode), [`VmError::host`] for anything else. It must not panic:
+/// a panic propagates to the caller of [`Vm::call`] but poisons the VM until [`Vm::reset`] (see
+/// [`Host`]). Engines that run untrusted progs should hold their builtins to the same lints as
+/// qcvm (no `unwrap`, indexing or arithmetic that can panic).
 pub type BuiltinFn<H> = fn(&mut Vm<H>, &mut H) -> Result<(), VmError>;
 
 /// Which builtin numbering a registry follows.

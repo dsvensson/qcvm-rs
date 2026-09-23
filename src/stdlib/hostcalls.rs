@@ -89,7 +89,7 @@ pub fn objerror<H: Host>(vm: &mut Vm<H>, host: &mut H) -> Result<(), VmError> {
         text.extend_from_slice(&super::reflect::entity_block(&vm.core, e));
         host.dump(DumpKind::ObjError, &text);
         if e != 0 {
-            vm.remove(EntRef(e), false);
+            super::entity::remove_entity(vm, host, EntRef(e), false);
         }
     }
     Err(VmError::new(ErrorKind::QcError(msg.into())))
