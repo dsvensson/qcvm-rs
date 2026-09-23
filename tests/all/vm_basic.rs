@@ -659,3 +659,27 @@ fn csqc_spawn_defaults_fill_the_dimension_fields() {
     let e = vm.spawn().unwrap();
     assert_eq!(vm.get_field(e, solid), Some(0.0));
 }
+
+/// The re-entrancy cap stops runaway builtin recursion before it exhausts a small native stack:
+/// each level costs about 1 KiB in optimised builds. Unoptimised, the interpreter's own frame is
+/// around 100 KiB, so debug builds get a larger stack.
+#[test]
+fn reentrancy_limit_fits_a_small_thread_stack() {
+    let run = || {
+        let mut asm = Asm::new();
+        let cb = asm.builtin("callback", 1, 1);
+        let cb_g = asm.global("cb_g", ty::FUNCTION, &[cb]);
+        let f = asm.function("recurse", &[1], 0);
+        asm.emit(Op::StoreF, f.local(0), parm(0), 0);
+        asm.emit(Op::Call1, cb_g, 0, 0);
+        asm.emit(Op::Return, OFS_RETURN, 0, 0);
+        let mut b = Builtins::empty(Numbering::None);
+        b.set_numbered(1, "callback", b_callback);
+        let mut vm = vm_with(&asm, b);
+        let mut host = TestHost { callback: Some(func(&vm, "recurse")), ..TestHost::default() };
+        let e = vm.call(&mut host, func(&vm, "recurse"), &[Arg::Float(0.0)]).unwrap_err();
+        assert_eq!(*e.kind(), ErrorKind::Reentrancy);
+    };
+    let stack = if cfg!(debug_assertions) { 1024 } else { 256 } * 1024;
+    std::thread::Builder::new().stack_size(stack).spawn(run).unwrap().join().unwrap();
+}

@@ -14,7 +14,9 @@ pub struct Limits {
     pub call_depth: u32,
     /// Instruction budget per call, counted at jumps, calls and returns (FTE: 100,000,000).
     pub runaway: u32,
-    /// Maximum nesting of builtin → QuakeC → builtin calls.
+    /// Maximum nesting of builtin → QuakeC → builtin calls. Each level takes about 1 KiB of
+    /// native stack in optimised builds (unoptimised builds need far more), plus what the host's
+    /// builtins use.
     pub reentry: u32,
     /// Maximum size of the QuakeC heap in bytes.
     pub heap_bytes: u32,
