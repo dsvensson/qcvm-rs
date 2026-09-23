@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::bytes::usize_from;
 use crate::error::{Backtrace, BacktraceFrame, ErrorKind, Warning, WarningKind};
-use crate::progs::{FunctionKind, Program, Type};
+use crate::progs::{FunctionKind, Program, Stmt, Type};
 use crate::value::FuncRef;
 use crate::vm::config::VmConfig;
 use crate::vm::memory::Memory;
@@ -108,6 +108,9 @@ pub(crate) struct ProgsState {
     pub(crate) program: Arc<Program>,
     /// Byte address of its globals.
     pub(crate) gbase: u32,
+    /// The program's statements with their global operands relocated to absolute byte addresses
+    /// in region S (so the interpreter does not add the globals base to every operand).
+    pub(crate) code: Arc<[Stmt]>,
     pub(crate) callees: Box<[Callee]>,
     pub(crate) state: StateHandles,
     /// This progs' copy of each shared-global slot (see `multiprogs`).
@@ -118,6 +121,22 @@ impl ProgsState {
     pub(crate) fn num_globals(&self) -> u32 {
         self.program.num_globals()
     }
+}
+
+/// A program's statements with global operands relocated from globals-relative to absolute byte
+/// addresses (the globals start at `gbase`).
+pub(crate) fn relocate(program: &Program, gbase: u32) -> Arc<[Stmt]> {
+    program
+        .statements
+        .iter()
+        .map(|&st| {
+            let [ka, kb, kc] = st.op.operands();
+            let at = |kind: crate::opcode::Operand, v: u32| {
+                if kind.is_relocated() { v.wrapping_add(gbase) } else { v }
+            };
+            Stmt { a: at(ka, st.a), b: at(kb, st.b), c: at(kc, st.c), ..st }
+        })
+        .collect()
 }
 
 /// One entity field of the VM-wide field layout.

@@ -73,11 +73,11 @@ pub(crate) enum Exit {
 
 /// Runs until the frame stack returns to `exit_depth`, a builtin must be called, or a fault.
 pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit {
-    // The current progs' program, cloned once and refreshed only when a call or return switches
-    // progs (not on every call, which would cost two atomic operations each).
+    // The current progs' relocated statements, cloned once and refreshed only when a call or
+    // return switches progs (not on every call, which would cost two atomic operations each).
     let mut cached_pr = u8::MAX;
-    let mut cached: Arc<crate::progs::Program> = match core.progs.first() {
-        Some(p) => Arc::clone(&p.program),
+    let mut cached: Arc<[crate::progs::Stmt]> = match core.progs.first() {
+        Some(p) => Arc::clone(&p.code),
         None => return Exit::Fault(ErrorKind::InvalidFunction(FuncRef::NULL)),
     };
     'reload: loop {
@@ -89,10 +89,10 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
             )));
         };
         if cached_pr != prnum {
-            cached = Arc::clone(&ps.program);
+            cached = Arc::clone(&ps.code);
             cached_pr = prnum;
         }
-        let stmts: &[crate::progs::Stmt] = &cached.statements;
+        let stmts: &[crate::progs::Stmt] = &cached;
         let gb = usize_from(ps.gbase);
         let gbase_u32 = ps.gbase;
         let ng = ps.num_globals();
@@ -125,9 +125,7 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
             let Some(&st) = stmts.get(usize_from(pc)) else {
                 fault!(ErrorKind::JumpOutOfRange);
             };
-            let oa = gb.wrapping_add(usize_from(st.a));
-            let ob = gb.wrapping_add(usize_from(st.b));
-            let oc = gb.wrapping_add(usize_from(st.c));
+            let (oa, ob, oc) = (usize_from(st.a), usize_from(st.b), usize_from(st.c));
             let s = core.mem.s.as_mut_slice();
 
             macro_rules! f3 {

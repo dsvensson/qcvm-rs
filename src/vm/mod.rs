@@ -1097,7 +1097,9 @@ fn build_core<H: Host>(
         .collect::<Vec<_>>();
 
     let callees = bind(&program, builtins);
-    let progs = vec![ProgsState { program, gbase: gbase_u32, callees, state, shared: Vec::new() }];
+    let code = core::relocate(&program, gbase_u32);
+    let progs =
+        vec![ProgsState { program, gbase: gbase_u32, code, callees, state, shared: Vec::new() }];
 
     let mut core = Core {
         mem,
