@@ -154,6 +154,10 @@ impl<H: Host> Vm<H> {
     /// Fails if called while QuakeC is running, or with the first error a resumed thread raised
     /// (threads not yet resumed stay queued).
     pub fn run_threads(&mut self, host: &mut H) -> Result<usize, VmError> {
+        self.guarded(|vm| vm.run_threads_inner(host))
+    }
+
+    fn run_threads_inner(&mut self, host: &mut H) -> Result<usize, VmError> {
         if self.core.nesting > 0 {
             return Err(VmError::host("run_threads called while QuakeC is running"));
         }

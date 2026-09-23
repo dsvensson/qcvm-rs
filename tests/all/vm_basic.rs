@@ -748,3 +748,77 @@ fn traceon_reports_statements() {
     vm.call(&mut host, main, &[]).unwrap();
     assert!(host.lines.len() > 5 && host.lines[5].starts_with("main:"), "{:#?}", host.lines);
 }
+
+fn b_panic(_vm: &mut Vm<TestHost>, _host: &mut TestHost) -> Result<(), VmError> {
+    panic!("host builtin bug");
+}
+
+/// A panic in a host builtin propagates unchanged, and leaves the VM refusing to run QuakeC
+/// until it is reset.
+#[test]
+fn a_panicking_builtin_poisons_the_vm() {
+    let mut asm = Asm::new();
+    let p = asm.builtin("boom", 1, 0);
+    let p_g = asm.global("boom_g", ty::FUNCTION, &[p]);
+    asm.function("main", &[], 0);
+    asm.emit(Op::Call0, p_g, 0, 0);
+    asm.emit(Op::Done, 0, 0, 0);
+    asm.function("fine", &[], 0);
+    asm.emit(Op::Done, 0, 0, 0);
+    let mut b = Builtins::empty(Numbering::None);
+    b.set_numbered(1, "boom", b_panic);
+    let mut vm = vm_with(&asm, b);
+    let mut host = TestHost::default();
+    let main = func(&vm, "main");
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = vm.call(&mut host, main, &[]);
+    }));
+    let msg = caught.unwrap_err();
+    assert_eq!(msg.downcast_ref::<&str>(), Some(&"host builtin bug"));
+    let fine = func(&vm, "fine");
+    assert_eq!(*vm.call(&mut host, fine, &[]).unwrap_err().kind(), ErrorKind::Poisoned);
+    assert_eq!(*vm.run_threads(&mut host).unwrap_err().kind(), ErrorKind::Poisoned);
+    vm.reset().unwrap();
+    vm.call(&mut host, fine, &[]).unwrap();
+}
+
+/// Vector copies through pointers whose source and destination overlap behave as if copied
+/// through a temporary (FTE's result depends on its C compiler; see docs/spec/deviations.md).
+#[test]
+fn overlapping_vector_pointer_copies() {
+    let mut asm = Asm::new();
+    let block = asm.alloc(4, &[1.0f32, 2.0, 3.0, 4.0].map(f32::to_bits));
+    let (zero, one) = (asm.int(0), asm.int(1));
+    let f = asm.function("store", &[], 1);
+    // STOREP_V: the first three words onto the last three.
+    asm.emit(Op::GlobalAddress, block, one, f.local(0));
+    asm.emit(Op::StorePV, block, f.local(0), 0);
+    asm.emit(Op::Done, 0, 0, 0);
+    let g = asm.function("load", &[], 1);
+    // LOADP_V: read through a pointer to the first word, writing from the second.
+    asm.emit(Op::GlobalAddress, block, zero, g.local(0));
+    asm.emit(Op::LoadPV, g.local(0), zero, block + 1);
+    asm.emit(Op::Done, 0, 0, 0);
+    asm.def_global("block", ty::FLOAT, block);
+    for (name, format) in [("store", qcvm::ProgsFormat::Fte16), ("load", qcvm::ProgsFormat::Fte32)]
+    {
+        let program = std::sync::Arc::new(qcvm::Program::parse(&asm.build(format)).unwrap());
+        let mut vm: Vm<TestHost> = Vm::new(
+            program,
+            std::sync::Arc::new(Builtins::empty(Numbering::None)),
+            qcvm::VmConfig::default(),
+        )
+        .unwrap();
+        let mut host = TestHost::default();
+        let f = vm.find_function(name).unwrap();
+        vm.call(&mut host, f, &[]).unwrap();
+        let base = vm.global::<f32>("block").unwrap().ptr().0;
+        let words: Vec<f32> = (0..4)
+            .map(|i| {
+                let b = vm.read_mem(qcvm::Ptr(base + 4 * i), 4).unwrap();
+                f32::from_le_bytes(b.try_into().unwrap())
+            })
+            .collect();
+        assert_eq!(words, [1.0, 1.0, 2.0, 3.0], "{name}");
+    }
+}

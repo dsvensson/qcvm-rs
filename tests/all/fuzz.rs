@@ -5,7 +5,8 @@
 //! Each case assembles functions from random statements — any opcode number, operands mostly
 //! within the globals (so they do something) and sometimes anywhere — over globals holding random
 //! words, fields, a spawned entity and builtins that re-enter QuakeC, allocate temp strings and
-//! suspend threads. Running them may fail in any way the VM reports, but must not panic. Set
+//! suspend threads. Running them may fail in any way the VM reports, but must not panic. The
+//! standard builtins get the same treatment: random call sequences with hostile arguments. Set
 //! `QCVM_FUZZ_CASES` for a longer run.
 
 use std::sync::Arc;
@@ -148,5 +149,134 @@ proptest! {
         }
         let _ = vm.collect_garbage();
         vm.reset().unwrap();
+    }
+}
+
+// ---- standard builtins with hostile arguments -------------------------------------------------
+
+/// A progs that declares every builtin of `registry` (by number where it has one, else by name)
+/// together with the globals and fields the standard builtins look up.
+fn builtin_progs(registry: &Builtins<qcvm::NullHost>) -> (Vec<u8>, Vec<String>) {
+    let mut asm = Asm::new();
+    asm.global("self", ty::ENTITY, &[]);
+    asm.global("other", ty::ENTITY, &[]);
+    asm.global("time", ty::FLOAT, &[]);
+    for v in ["v_forward", "v_right", "v_up"] {
+        asm.global(v, ty::VECTOR, &[0, 0, 0]);
+    }
+    for (name, t) in [
+        ("origin", ty::VECTOR),
+        ("mins", ty::VECTOR),
+        ("maxs", ty::VECTOR),
+        ("angles", ty::VECTOR),
+        ("gravitydir", ty::VECTOR),
+        ("solid", ty::FLOAT),
+        ("flags", ty::FLOAT),
+        ("ideal_yaw", ty::FLOAT),
+        ("yaw_speed", ty::FLOAT),
+        ("idealpitch", ty::FLOAT),
+        ("pitch_speed", ty::FLOAT),
+        ("health", ty::FLOAT),
+        ("chain", ty::ENTITY),
+        ("classname", ty::STRING),
+        ("think", ty::FUNCTION),
+    ] {
+        asm.field(name, t);
+    }
+    for s in ["", "hello world", r"a\b\c", "{\"k\": [1, 2.5, \"x\"]}", "%s %d %v %c", "MD5"] {
+        asm.string(s);
+    }
+    let mut names = Vec::new();
+    for (name, number) in registry.registered() {
+        let name = String::from_utf8_lossy(name).into_owned();
+        let f = asm.builtin(&name, number.unwrap_or(0), -1);
+        asm.global(&format!("{name}_ref"), ty::FUNCTION, &[f]);
+        names.push(name);
+    }
+    let f = asm.function("callback", &[1, 1], 1);
+    asm.emit(Op::AddF, f.local(0), f.local(1), f.local(2));
+    asm.emit(Op::Return, f.local(2), 0, 0);
+    (asm.build(ProgsFormat::Fte16), names)
+}
+
+/// An argument word: floats (ordinary and extreme), string references (program strings, temps,
+/// interned, invalid), entity numbers, pointers and arbitrary bits.
+fn arg_word() -> impl Strategy<Value = u32> {
+    prop_oneof![
+        (-10.0f32..300.0).prop_map(f32::to_bits),
+        prop::sample::select(vec![
+            f32::NAN.to_bits(),
+            f32::INFINITY.to_bits(),
+            f32::NEG_INFINITY.to_bits(),
+            3.0e9f32.to_bits(),
+            (-3.0e9f32).to_bits(),
+            1.0e20f32.to_bits(),
+            f32::MIN_POSITIVE.to_bits(),
+            (-0.0f32).to_bits(),
+        ]),
+        0u32..64,
+        (0u32..8).prop_map(|k| 0x8000_0000 | k),
+        (0u32..4).prop_map(|k| 0xC000_0000 | k),
+        prop::sample::select(vec![0xFFFF_FFFF, 0x7FFF_FFFF, 0x4000_0000, 1 << 24]),
+        any::<u32>(),
+    ]
+}
+
+type Calls = Vec<(prop::sample::Index, u8, [[u32; 3]; 8])>;
+
+fn run_builtin_calls(numbering: Numbering, calls: &Calls) {
+    let registry = Builtins::<qcvm::NullHost>::standard(numbering);
+    let (dat, names) = builtin_progs(&registry);
+    let program = Arc::new(Program::parse(&dat).unwrap());
+    let limits = Limits { runaway: 100_000, heap_bytes: 1 << 22, ..Limits::default() };
+    let config = VmConfig { limits, developer: true, ..VmConfig::csqc() };
+    let mut vm = Vm::new(program, Arc::new(registry), config).unwrap();
+    let mut host = qcvm::NullHost;
+    for _ in 0..3 {
+        let _ = vm.spawn();
+    }
+    for text in [&b"temp one"[..], b"", b"t\xC3\xA9mp", b"^1red ^7white"] {
+        let _ = vm.temp(text);
+    }
+    let _ = vm.intern(b"interned");
+    for (pick, argc, args) in calls {
+        let name = &names[pick.index(names.len())];
+        let Some(f) = vm.find_function(name) else { continue };
+        let args: Vec<Arg<'_>> =
+            args.iter().take(usize::from(*argc % 9)).map(|&w| Arg::Raw(w)).collect();
+        let _ = vm.call(&mut host, f, &args);
+        let _ = vm.run_threads(&mut host);
+    }
+    let _ = vm.collect_garbage();
+}
+
+fn calls() -> impl Strategy<Value = Calls> {
+    prop::collection::vec(
+        (
+            any::<prop::sample::Index>(),
+            any::<u8>(),
+            prop::array::uniform8(prop::array::uniform3(arg_word())),
+        ),
+        1..24,
+    )
+}
+
+proptest! {
+    // Each case builds a VM with every builtin declared, so run a quarter as many by default.
+    #![proptest_config(ProptestConfig::with_cases(cases().div_ceil(4)))]
+
+    #[test]
+    fn standard_builtins_never_panic_csqc(calls in calls()) {
+        run_builtin_calls(Numbering::Csqc, &calls);
+    }
+
+    #[test]
+    fn standard_builtins_never_panic_ssqc(calls in calls()) {
+        run_builtin_calls(Numbering::Ssqc, &calls);
+    }
+
+    #[test]
+    fn standard_builtins_never_panic_menu(calls in calls()) {
+        run_builtin_calls(Numbering::Menu, &calls);
     }
 }

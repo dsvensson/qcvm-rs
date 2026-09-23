@@ -228,6 +228,8 @@ pub(crate) struct Core {
     pub(crate) trace: bool,
     /// Tracing: the statement at `x.pc` has been reported and runs next.
     pub(crate) traced: bool,
+    /// A panic unwound through QuakeC execution; only `reset` makes the VM usable again.
+    pub(crate) poisoned: bool,
     /// Field words zeroed by `remove`.
     pub(crate) remove_clears: Vec<u32>,
     /// Resolved [`crate::vm::SpawnDefault`]s.

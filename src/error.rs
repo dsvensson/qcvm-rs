@@ -91,7 +91,8 @@ pub enum ErrorKind {
     Builtin(String),
     /// A host-side error raised from a builtin.
     Host(String),
-    /// The VM is in an inconsistent state after a builtin panicked; call `reset`.
+    /// A panic (from a host builtin) unwound through QuakeC execution, leaving the VM in an
+    /// inconsistent state; call `Vm::reset`.
     Poisoned,
 }
 

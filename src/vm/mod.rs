@@ -289,6 +289,29 @@ impl<H: Host> Vm<H> {
     /// # Errors
     /// Any runtime error raised while the function runs; the VM stays usable.
     pub fn call(&mut self, host: &mut H, f: FuncRef, args: &[Arg<'_>]) -> Result<Ret, VmError> {
+        self.guarded(|vm| vm.call_inner(host, f, args))
+    }
+
+    /// Runs `f`, which may execute QuakeC. If a panic (from a host builtin) unwinds through it,
+    /// the VM is left mid-call: it is marked poisoned and the panic continues. A poisoned VM
+    /// refuses to run QuakeC ([`ErrorKind::Poisoned`]) until [`Vm::reset`].
+    fn guarded<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<R, VmError>,
+    ) -> Result<R, VmError> {
+        if self.core.poisoned {
+            return Err(ErrorKind::Poisoned.into());
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
+            Ok(result) => result,
+            Err(panic) => {
+                self.core.poisoned = true;
+                std::panic::resume_unwind(panic)
+            }
+        }
+    }
+
+    fn call_inner(&mut self, host: &mut H, f: FuncRef, args: &[Arg<'_>]) -> Result<Ret, VmError> {
         if self.core.nesting >= self.core.config.limits.reentry {
             return Err(ErrorKind::Reentrancy.into());
         }
@@ -1151,6 +1174,7 @@ fn build_core<H: Host>(
         suppressed: 0,
         trace: false,
         traced: false,
+        poisoned: false,
         remove_clears,
         spawn_defaults,
         std: crate::stdlib::StdState::default(),

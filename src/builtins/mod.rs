@@ -125,11 +125,34 @@ impl<H: Host> Builtins<H> {
         self.by_name.contains_key(name.as_bytes())
     }
 
+    /// The registered builtins, sorted by name, with the number each is bound to (`None` for
+    /// builtins bound by name only).
+    #[must_use]
+    pub fn registered(&self) -> Vec<(&[u8], Option<u32>)> {
+        let mut out: Vec<(&[u8], Option<u32>)> = self
+            .by_name
+            .iter()
+            .map(|(name, &i)| {
+                let number = self
+                    .entries
+                    .get(i)
+                    .and_then(|e| e.number)
+                    .filter(|n| self.by_number.get(n) == Some(&i));
+                (&**name, number)
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
     fn insert(&mut self, name: &[u8], number: Option<u32>, func: BuiltinFn<H>) {
         let index = match self.by_name.get(name) {
             Some(&i) => {
                 if let Some(entry) = self.entries.get_mut(i) {
-                    if let Some(old) = entry.number {
+                    // Unbind the old number, unless another builtin has taken it over since.
+                    if let Some(old) = entry.number
+                        && self.by_number.get(&old) == Some(&i)
+                    {
                         self.by_number.remove(&old);
                     }
                     *entry = Entry { name: name.into(), number, func };

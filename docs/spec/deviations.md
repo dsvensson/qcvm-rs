@@ -23,6 +23,7 @@ production code should leave them off.
 | Pointer bound check | `p + n < used`, 32-bit arithmetic (wraps) | `p + n <= end` of the region, without wrapping | — |
 | `LOADP_ITOF`/`LOADP_FTOI` | checks 1 byte, reads 4 | checks 4 bytes | — |
 | 12-byte temp-string fallback read | faults | zero-fills like smaller reads | — |
+| `STOREP_V`/`LOADP_V` with overlapping source and destination | depends on how the C compiler copies the vector: copying the first three words of `[1,2,3,4]` one word up leaves `[1,2,2]` in the destination with the reference build | copies as if through a temporary: `[1,2,3]` | — |
 | Operand sanitizer | treats `SWITCH_*.b` as a global operand (large switches get poisoned) | `SWITCH_*.b` is a jump offset | — |
 | `DIV_I64`/`DIV_U64` | unguarded (host process traps on /0 and `MIN / -1`) | `/0 → 0`, `MIN / -1 → MIN` | — |
 | Entity limit | never allocates the last slot below `maxedicts` | allocates every slot below `Limits::max_edicts` (which counts the world) | — |
