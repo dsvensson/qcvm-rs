@@ -18,6 +18,7 @@ pub mod introspect;
 pub mod json;
 pub mod math;
 pub mod memory;
+pub mod progs;
 pub mod reflect;
 pub mod strbuf;
 pub mod strftime;
@@ -51,6 +52,7 @@ pub(crate) fn register_all<H: Host>(b: &mut Builtins<H>) {
     json::register(b);
     math::register(b);
     memory::register(b);
+    progs::register(b);
     reflect::register(b);
     strbuf::register(b);
     strftime::register(b);

@@ -127,6 +127,9 @@ pub struct VmConfig {
     pub first_spawnable: u32,
     /// Extra bytes reserved per entity for fields added later (`ensure_field`, `addprogs`).
     pub field_reserve_bytes: u32,
+    /// Globals copied between progs when execution switches from one progs to another (in
+    /// addition to globals the compiler flagged as shared).
+    pub shared_globals: Vec<String>,
     /// FTE-compatibility switches (testing only).
     pub compat: FteCompat,
 }
@@ -149,6 +152,7 @@ impl VmConfig {
             remove_clears: clears.iter().map(|s| (*s).to_owned()).collect(),
             first_spawnable: 0,
             field_reserve_bytes: 256,
+            shared_globals: ["self", "other", "time", "frametime"].map(String::from).to_vec(),
             compat: FteCompat::default(),
         }
     }

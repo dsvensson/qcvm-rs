@@ -110,6 +110,8 @@ pub(crate) struct ProgsState {
     pub(crate) gbase: u32,
     pub(crate) callees: Box<[Callee]>,
     pub(crate) state: StateHandles,
+    /// This progs' copy of each shared-global slot (see `multiprogs`).
+    pub(crate) shared: Vec<Option<crate::vm::multiprogs::SharedGlobal>>,
 }
 
 impl ProgsState {
@@ -199,6 +201,8 @@ pub(crate) struct Core {
     pub(crate) std: crate::stdlib::StdState,
     /// The value `abort(ret)` returns from the engine boundary it unwound to.
     pub(crate) abort_ret: Option<[u32; 3]>,
+    /// Globals kept in sync between progs.
+    pub(crate) shared: crate::vm::multiprogs::SharedTable,
 }
 
 impl Core {
@@ -244,6 +248,9 @@ impl Core {
         let depth_limit = usize_from(self.config.limits.call_depth);
         if self.frames.len() >= depth_limit {
             return Err(ErrorKind::CallDepth);
+        }
+        if prnum != self.x.prnum && self.progs.len() > 1 {
+            crate::vm::multiprogs::switch_in(self, self.x.prnum, prnum);
         }
         let ps = self
             .progs
@@ -301,6 +308,7 @@ impl Core {
 
     /// Returns from the current function: restores its caller's locals and context.
     pub(crate) fn leave(&mut self) {
+        let callee_prnum = self.x.prnum;
         if let Some(ps) = self.progs.get(usize::from(self.x.prnum))
             && let Some(f) = ps.program.func(self.x.func)
         {
@@ -324,6 +332,9 @@ impl Core {
             } else {
                 self.x.switch_ref = frame.switch_ref;
                 self.x.switch_kind = frame.switch_kind;
+            }
+            if frame.prnum != callee_prnum {
+                crate::vm::multiprogs::switch_out(self, callee_prnum, frame.prnum);
             }
         }
     }

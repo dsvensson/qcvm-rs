@@ -481,10 +481,13 @@ impl Program {
         self.globals.get(usize_from(index)).copied()
     }
 
-    /// Looks up a function by name.
+    /// Looks up a function by name, as the program was loaded.
     ///
     /// Like FTE, a function-typed *global* with that name takes precedence over the function
-    /// table's names, so that `var`-declared entry points resolve to their current value.
+    /// table's names; this reads its initial value. [`Vm::find_function`] reads the value QuakeC
+    /// has left in it since.
+    ///
+    /// [`Vm::find_function`]: crate::Vm::find_function
     #[must_use]
     pub fn function_index(&self, name: impl AsRef<[u8]>) -> Option<u32> {
         let name = name.as_ref();

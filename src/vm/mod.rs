@@ -7,6 +7,7 @@ pub(crate) mod core;
 pub(crate) mod heap;
 pub(crate) mod interp;
 pub(crate) mod memory;
+pub(crate) mod multiprogs;
 pub(crate) mod num;
 pub(crate) mod strings;
 
@@ -20,7 +21,6 @@ pub use strings::GcStats;
 
 use self::core::{
     Callee, Core, Exec, FieldTable, NO_FUNCTION, OFS_PARM0, OFS_RETURN, ProgsState, Rng,
-    StateHandles,
 };
 use self::interp::Exit;
 use self::memory::Memory;
@@ -213,11 +213,13 @@ impl<H: Host> Vm<H> {
 
     // ---- lookups ------------------------------------------------------------------------
 
-    /// Looks up a function of the main progs by name.
+    /// Looks up a function of the main progs by name, as QuakeC sees it now: a function-typed
+    /// global of that name supplies its current value (QuakeC may have redirected it, to a
+    /// function of another progs too, or cleared it, which gives `None`); otherwise the function
+    /// of that name.
     #[must_use]
     pub fn find_function(&self, name: impl AsRef<[u8]>) -> Option<FuncRef> {
-        let index = self.program().function_index(name)?;
-        Some(FuncRef::new(PrNum(0), index))
+        multiprogs::find_live_function(&self.core, 0, name.as_ref())
     }
 
     /// A typed handle to a global of the main progs.
@@ -300,7 +302,13 @@ impl<H: Host> Vm<H> {
             self.core.suppressed = 0;
         }
         let saved = (self.core.argc, self.core.builtin);
-        self.write_args(pr, args)?;
+        // QuakeC callees take their arguments from the calling context's PARM slots (entering a
+        // function of another progs copies them over); builtins read their own progs' slots.
+        let (args_pr, ret_pr) = match callee {
+            Some(Callee::Qc) => (self.core.x.prnum, self.core.x.prnum),
+            _ => (pr, pr),
+        };
+        self.write_args(args_pr, args)?;
         self.core.argc = u32::try_from(args.len()).unwrap_or(u32::MAX);
         self.core.nesting = self.core.nesting.saturating_add(1);
 
@@ -328,7 +336,7 @@ impl<H: Host> Vm<H> {
 
         self.core.nesting = self.core.nesting.saturating_sub(1);
         (self.core.argc, self.core.builtin) = saved;
-        let ret = self.core.abort_ret.take().unwrap_or_else(|| self.read_return(pr));
+        let ret = self.core.abort_ret.take().unwrap_or_else(|| self.read_return(ret_pr));
         if top_level {
             if self.core.suppressed > 0 {
                 let n = self.core.suppressed;
@@ -950,7 +958,7 @@ fn missing(core: &Core, f: FuncRef) -> ErrorKind {
 }
 
 /// Binds each function record of `program` to a callee.
-fn bind<H: Host>(program: &Program, builtins: &Builtins<H>) -> Box<[Callee]> {
+pub(crate) fn bind<H: Host>(program: &Program, builtins: &Builtins<H>) -> Box<[Callee]> {
     program
         .functions()
         .map(|f| match f.kind {
@@ -1061,28 +1069,22 @@ fn build_core<H: Host>(
         fields.push(d.name, d.ty, d.offset);
     }
 
-    let global_at = |name: &str| {
-        program
-            .global_def(name)
-            .and_then(|d| d.offset.checked_mul(4).and_then(|o| o.checked_add(gbase_u32)))
-    };
+    let state = multiprogs::state_handles(&program, gbase_u32, &fields);
     let field_ofs = |name: &str| fields.get(name.as_bytes()).map(|f| f.ofs);
-    let state = StateHandles {
-        self_g: global_at("self"),
-        time_g: global_at("time"),
-        cycle_wrapped_g: global_at("cycle_wrapped"),
-        frame_f: field_ofs("frame"),
-        think_f: field_ofs("think"),
-        nextthink_f: field_ofs("nextthink"),
-        weaponframe_f: field_ofs("weaponframe"),
-    };
     let remove_clears =
         config.remove_clears.iter().filter_map(|n| field_ofs(n)).collect::<Vec<_>>();
 
     let callees = bind(&program, builtins);
-    let progs = vec![ProgsState { program, sbase: 0, gbase: gbase_u32, callees, state }];
+    let progs = vec![ProgsState {
+        program,
+        sbase: 0,
+        gbase: gbase_u32,
+        callees,
+        state,
+        shared: Vec::new(),
+    }];
 
-    Ok(Core {
+    let mut core = Core {
         mem,
         strings: Strings::new(limits.temp_strings, limits.temp_string_bytes),
         progs,
@@ -1100,6 +1102,9 @@ fn build_core<H: Host>(
         remove_clears,
         std: crate::stdlib::StdState::default(),
         abort_ret: None,
+        shared: multiprogs::SharedTable::default(),
         config,
-    })
+    };
+    multiprogs::register_shared(&mut core, 0);
+    Ok(core)
 }

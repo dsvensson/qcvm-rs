@@ -20,5 +20,6 @@ mod builtins_strings;
 mod differential;
 mod license;
 mod loader;
+mod multiprogs;
 mod opcodes;
 mod vm_basic;
