@@ -4,4 +4,6 @@
 
 pub mod asm;
 pub mod harness;
+pub mod qcc;
+pub mod runner;
 pub mod tools;

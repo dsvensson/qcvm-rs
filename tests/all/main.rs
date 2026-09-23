@@ -17,6 +17,7 @@ mod support;
 
 mod builtins_misc;
 mod builtins_strings;
+mod differential;
 mod license;
 mod loader;
 mod opcodes;
