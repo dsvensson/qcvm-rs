@@ -298,6 +298,7 @@ impl Core {
 
     /// Enters QuakeC function `index` of progs `prnum`, resuming the current context at
     /// `resume_pc` when it returns.
+    #[inline(never)]
     pub(crate) fn enter(&mut self, prnum: u8, index: u32, resume_pc: u32) -> Result<(), ErrorKind> {
         let depth_limit = usize_from(self.config.limits.call_depth);
         if self.frames.len() >= depth_limit {
@@ -362,6 +363,7 @@ impl Core {
     }
 
     /// Returns from the current function: restores its caller's locals and context.
+    #[inline(never)]
     pub(crate) fn leave(&mut self) {
         let callee_prnum = self.x.prnum;
         if let Some(ps) = self.progs.get(usize::from(self.x.prnum))

@@ -504,10 +504,10 @@ impl<H: Host> Vm<H> {
                 if self.deadline.is_some() { self.budget.min(BUDGET_CHUNK) } else { self.budget };
             let mut left = chunk;
             let exit = if self.core.trace {
-                interp::run::<true>(&mut self.core, exit_depth, &mut left)
+                interp::run_traced(&mut self.core, exit_depth, &mut left)
             } else {
                 self.core.traced = false;
-                interp::run::<false>(&mut self.core, exit_depth, &mut left)
+                interp::run_fast(&mut self.core, exit_depth, &mut left)
             };
             if !matches!(exit, Exit::Budget) {
                 self.budget = self.budget.saturating_sub(chunk.saturating_sub(left));

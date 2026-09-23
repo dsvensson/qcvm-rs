@@ -76,9 +76,23 @@ pub(crate) enum Exit {
     Fault(ErrorKind),
 }
 
+/// [`run`] without tracing. The entry points are not generic, so the interpreter is compiled once,
+/// in this crate — not in every crate that instantiates a `Vm<H>` (which would also compile it at
+/// that crate's optimisation level).
+#[inline(never)]
+pub(crate) fn run_fast(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit {
+    run::<false>(core, exit_depth, budget)
+}
+
+/// [`run`] with tracing.
+#[inline(never)]
+pub(crate) fn run_traced(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit {
+    run::<true>(core, exit_depth, budget)
+}
+
 /// Runs until the frame stack returns to `exit_depth`, a builtin must be called, or a fault.
 /// With `TRACE`, also stops before every statement that has not been reported yet.
-pub(crate) fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit {
+fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit {
     // The current progs' relocated statements, cloned once and refreshed only when a call or
     // return switches progs (not on every call, which would cost two atomic operations each).
     let mut cached_pr = u8::MAX;
@@ -1350,6 +1364,10 @@ fn bad_field_access(core: &mut Core, e: u32, f: u32) {
 }
 
 /// `STOREF_*`: writes `words` words from global `oc` into field `B` of entity `A`.
+///
+/// This and the other larger helpers of the loop stay out of line: inlined, they made the
+/// interpreter slower overall (more register pressure in the dispatch loop).
+#[inline(never)]
 fn store_field(core: &mut Core, oa: usize, ob: usize, oc: usize, words: u32) {
     let (e, f) = (core.mem.g(oa), core.mem.g(ob));
     if e >= core.mem.num_edicts() {
@@ -1460,6 +1478,7 @@ fn ptr_read_slow<const N: usize>(
 
 /// Writes bytes through a pointer: `base + offset`, with FTE's fallbacks (sentinel skip, temp
 /// strings grow when written past their end). Protected entities are skipped with a warning.
+#[inline(never)]
 pub(crate) fn ptr_write(
     core: &mut Core,
     base: u32,
@@ -1506,6 +1525,7 @@ fn ptr_write_slow(
 }
 
 /// The Hexen 2 read-modify-write opcodes that go through a pointer in `B`.
+#[inline(never)]
 fn compound_pointer_store(
     core: &mut Core,
     op: Op,
