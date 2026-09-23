@@ -11,13 +11,14 @@ pub(crate) fn u16_at(data: &[u8], off: usize) -> Option<u16> {
 /// Reads a little-endian `u32` at byte offset `off`.
 #[inline(always)]
 pub(crate) fn u32_at(data: &[u8], off: usize) -> Option<u32> {
-    data.get(off..)?.first_chunk::<4>().copied().map(u32::from_le_bytes)
+    let chunk = data.get(off..off.wrapping_add(4))?;
+    chunk.first_chunk::<4>().copied().map(u32::from_le_bytes)
 }
 
 /// Writes a little-endian `u32` at byte offset `off`. Returns `false` if out of range.
 #[inline(always)]
 pub(crate) fn put_u32(data: &mut [u8], off: usize, value: u32) -> bool {
-    match data.get_mut(off..).and_then(|s| s.first_chunk_mut::<4>()) {
+    match data.get_mut(off..off.wrapping_add(4)).and_then(|s| s.first_chunk_mut::<4>()) {
         Some(chunk) => {
             *chunk = value.to_le_bytes();
             true

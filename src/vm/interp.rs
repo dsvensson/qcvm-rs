@@ -73,6 +73,13 @@ pub(crate) enum Exit {
 
 /// Runs until the frame stack returns to `exit_depth`, a builtin must be called, or a fault.
 pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit {
+    // The current progs' program, cloned once and refreshed only when a call or return switches
+    // progs (not on every call, which would cost two atomic operations each).
+    let mut cached_pr = u8::MAX;
+    let mut cached: Arc<crate::progs::Program> = match core.progs.first() {
+        Some(p) => Arc::clone(&p.program),
+        None => return Exit::Fault(ErrorKind::InvalidFunction(FuncRef::NULL)),
+    };
     'reload: loop {
         let prnum = core.x.prnum;
         let Some(ps) = core.progs.get(usize::from(prnum)) else {
@@ -81,8 +88,11 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                 core.x.func,
             )));
         };
-        let program = Arc::clone(&ps.program);
-        let stmts = &program.statements[..];
+        if cached_pr != prnum {
+            cached = Arc::clone(&ps.program);
+            cached_pr = prnum;
+        }
+        let stmts: &[crate::progs::Stmt] = &cached.statements;
         let gb = usize_from(ps.gbase);
         let gbase_u32 = ps.gbase;
         let ng = ps.num_globals();
@@ -118,90 +128,90 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
             let oa = gb.wrapping_add(usize_from(st.a));
             let ob = gb.wrapping_add(usize_from(st.b));
             let oc = gb.wrapping_add(usize_from(st.c));
-            let m = &mut core.mem;
+            let s = core.mem.s.as_mut_slice();
 
             macro_rules! f3 {
                 ($op:tt) => {{
-                    let v = m.gf(oa) $op m.gf(ob);
-                    m.set_gf(oc, v);
+                    let v = gf(s, oa) $op gf(s, ob);
+                    setf(s, oc, v);
                 }};
             }
             macro_rules! v3 {
                 ($op:tt) => {{
                     for k in [0usize, 4, 8] {
-                        let v = m.gf(oa.wrapping_add(k)) $op m.gf(ob.wrapping_add(k));
-                        m.set_gf(oc.wrapping_add(k), v);
+                        let v = gf(s, oa.wrapping_add(k)) $op gf(s, ob.wrapping_add(k));
+                        setf(s, oc.wrapping_add(k), v);
                     }
                 }};
             }
             macro_rules! cmp_f {
                 ($op:tt) => {{
-                    let v = fbool(m.gf(oa) $op m.gf(ob));
-                    m.set_g(oc, v);
+                    let v = fbool(gf(s, oa) $op gf(s, ob));
+                    set(s, oc, v);
                 }};
             }
             macro_rules! cmp_i {
                 ($op:tt) => {{
-                    let v = ibool((m.g(oa).cast_signed()) $op (m.g(ob).cast_signed()));
-                    m.set_g(oc, v);
+                    let v = ibool((g(s, oa).cast_signed()) $op (g(s, ob).cast_signed()));
+                    set(s, oc, v);
                 }};
             }
             macro_rules! cmp_if {
                 ($op:tt) => {{
-                    let v = ibool((m.g(oa).cast_signed() as f32) $op m.gf(ob));
-                    m.set_g(oc, v);
+                    let v = ibool((g(s, oa).cast_signed() as f32) $op gf(s, ob));
+                    set(s, oc, v);
                 }};
             }
             macro_rules! cmp_fi {
                 ($op:tt) => {{
-                    let v = ibool(m.gf(oa) $op (m.g(ob).cast_signed() as f32));
-                    m.set_g(oc, v);
+                    let v = ibool(gf(s, oa) $op (g(s, ob).cast_signed() as f32));
+                    set(s, oc, v);
                 }};
             }
             macro_rules! i64_op {
                 ($f:expr) => {{
-                    let a = join64(m.g(oa), m.g(oa.wrapping_add(4))).cast_signed();
-                    let b = join64(m.g(ob), m.g(ob.wrapping_add(4))).cast_signed();
+                    let a = join64(g(s, oa), g(s, oa.wrapping_add(4))).cast_signed();
+                    let b = join64(g(s, ob), g(s, ob.wrapping_add(4))).cast_signed();
                     let f: fn(i64, i64) -> i64 = $f;
                     let (lo, hi) = split64(f(a, b).cast_unsigned());
-                    m.set_g(oc, lo);
-                    m.set_g(oc.wrapping_add(4), hi);
+                    set(s, oc, lo);
+                    set(s, oc.wrapping_add(4), hi);
                 }};
             }
             macro_rules! i64_cmp {
                 ($f:expr) => {{
-                    let a = join64(m.g(oa), m.g(oa.wrapping_add(4)));
-                    let b = join64(m.g(ob), m.g(ob.wrapping_add(4)));
+                    let a = join64(g(s, oa), g(s, oa.wrapping_add(4)));
+                    let b = join64(g(s, ob), g(s, ob.wrapping_add(4)));
                     let f: fn(u64, u64) -> bool = $f;
-                    m.set_g(oc, ibool(f(a, b)));
+                    set(s, oc, ibool(f(a, b)));
                 }};
             }
             macro_rules! d_op {
                 ($op:tt) => {{
-                    let a = f64::from_bits(join64(m.g(oa), m.g(oa.wrapping_add(4))));
-                    let b = f64::from_bits(join64(m.g(ob), m.g(ob.wrapping_add(4))));
+                    let a = f64::from_bits(join64(g(s, oa), g(s, oa.wrapping_add(4))));
+                    let b = f64::from_bits(join64(g(s, ob), g(s, ob.wrapping_add(4))));
                     let (lo, hi) = split64((a $op b).to_bits());
-                    m.set_g(oc, lo);
-                    m.set_g(oc.wrapping_add(4), hi);
+                    set(s, oc, lo);
+                    set(s, oc.wrapping_add(4), hi);
                 }};
             }
             macro_rules! d_cmp {
                 ($op:tt) => {{
-                    let a = f64::from_bits(join64(m.g(oa), m.g(oa.wrapping_add(4))));
-                    let b = f64::from_bits(join64(m.g(ob), m.g(ob.wrapping_add(4))));
-                    m.set_g(oc, ibool(a $op b));
+                    let a = f64::from_bits(join64(g(s, oa), g(s, oa.wrapping_add(4))));
+                    let b = f64::from_bits(join64(g(s, ob), g(s, ob.wrapping_add(4))));
+                    set(s, oc, ibool(a $op b));
                 }};
             }
             macro_rules! set64 {
                 ($off:expr, $v:expr) => {{
                     let (lo, hi) = split64($v);
-                    m.set_g($off, lo);
-                    m.set_g($off.wrapping_add(4), hi);
+                    set(s, $off, lo);
+                    set(s, $off.wrapping_add(4), hi);
                 }};
             }
             macro_rules! get64 {
                 ($off:expr) => {
-                    join64(m.g($off), m.g($off.wrapping_add(4)))
+                    join64(g(s, $off), g(s, $off.wrapping_add(4)))
                 };
             }
 
@@ -212,29 +222,29 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                 Op::AddF => f3!(+),
                 Op::SubF => f3!(-),
                 Op::MulV => {
-                    let a = m.gv(oa);
-                    let b = m.gv(ob);
-                    m.set_gf(oc, a[0] * b[0] + a[1] * b[1] + a[2] * b[2]);
+                    let a = gv(s, oa);
+                    let b = gv(s, ob);
+                    setf(s, oc, a[0] * b[0] + a[1] * b[1] + a[2] * b[2]);
                 }
                 Op::MulFV => {
-                    let f = m.gf(oa);
+                    let f = gf(s, oa);
                     for k in [0usize, 4, 8] {
-                        let v = f * m.gf(ob.wrapping_add(k));
-                        m.set_gf(oc.wrapping_add(k), v);
+                        let v = f * gf(s, ob.wrapping_add(k));
+                        setf(s, oc.wrapping_add(k), v);
                     }
                 }
                 Op::MulVF => {
-                    let f = m.gf(ob);
+                    let f = gf(s, ob);
                     for k in [0usize, 4, 8] {
-                        let v = m.gf(oa.wrapping_add(k)) * f;
-                        m.set_gf(oc.wrapping_add(k), v);
+                        let v = gf(s, oa.wrapping_add(k)) * f;
+                        setf(s, oc.wrapping_add(k), v);
                     }
                 }
                 Op::DivVF => {
-                    let f = m.gf(ob);
+                    let f = gf(s, ob);
                     for k in [0usize, 4, 8] {
-                        let v = m.gf(oa.wrapping_add(k)) / f;
-                        m.set_gf(oc.wrapping_add(k), v);
+                        let v = gf(s, oa.wrapping_add(k)) / f;
+                        setf(s, oc.wrapping_add(k), v);
                     }
                 }
                 Op::AddV => v3!(+),
@@ -248,23 +258,23 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                 Op::LtF => cmp_f!(<),
                 Op::GtF => cmp_f!(>),
                 Op::EqV => {
-                    let (a, b) = (m.gv(oa), m.gv(ob));
-                    m.set_g(oc, fbool(a[0] == b[0] && a[1] == b[1] && a[2] == b[2]));
+                    let (a, b) = (gv(s, oa), gv(s, ob));
+                    set(s, oc, fbool(a[0] == b[0] && a[1] == b[1] && a[2] == b[2]));
                 }
                 Op::NeV => {
-                    let (a, b) = (m.gv(oa), m.gv(ob));
-                    m.set_g(oc, fbool(a[0] != b[0] || a[1] != b[1] || a[2] != b[2]));
+                    let (a, b) = (gv(s, oa), gv(s, ob));
+                    set(s, oc, fbool(a[0] != b[0] || a[1] != b[1] || a[2] != b[2]));
                 }
                 Op::EqE | Op::EqFnc => {
-                    let v = fbool(m.g(oa) == m.g(ob));
-                    m.set_g(oc, v);
+                    let v = fbool(g(s, oa) == g(s, ob));
+                    set(s, oc, v);
                 }
                 Op::NeE | Op::NeFnc => {
-                    let v = fbool(m.g(oa) != m.g(ob));
-                    m.set_g(oc, v);
+                    let v = fbool(g(s, oa) != g(s, ob));
+                    set(s, oc, v);
                 }
                 Op::EqS | Op::NeS => {
-                    let (a, b) = (m.g(oa), m.g(ob));
+                    let (a, b) = (g(s, oa), g(s, ob));
                     core.x.pc = pc;
                     let v = string_compare(core, st.op, a, b);
                     core.mem.set_g(oc, v);
@@ -272,81 +282,81 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
 
                 // ---- logic ---------------------------------------------------------------
                 Op::NotF => {
-                    let v = fbool(!float_true(m.g(oa)));
-                    m.set_g(oc, v);
+                    let v = fbool(!float_true(g(s, oa)));
+                    set(s, oc, v);
                 }
                 Op::NotV => {
-                    let a = m.gv(oa);
-                    m.set_g(oc, fbool(a[0] == 0.0 && a[1] == 0.0 && a[2] == 0.0));
+                    let a = gv(s, oa);
+                    set(s, oc, fbool(a[0] == 0.0 && a[1] == 0.0 && a[2] == 0.0));
                 }
                 Op::NotS => {
-                    let r = m.g(oa);
+                    let r = g(s, oa);
                     core.x.pc = pc;
                     let empty = r == 0 || str_or_warn(core, r).is_empty();
                     core.mem.set_g(oc, fbool(empty));
                 }
                 Op::NotEnt => {
-                    let v = fbool(m.g(oa) == 0);
-                    m.set_g(oc, v);
+                    let v = fbool(g(s, oa) == 0);
+                    set(s, oc, v);
                 }
                 Op::NotFnc => {
-                    let v = fbool(m.g(oa) & 0x00FF_FFFF == 0);
-                    m.set_g(oc, v);
+                    let v = fbool(g(s, oa) & 0x00FF_FFFF == 0);
+                    set(s, oc, v);
                 }
                 Op::NotI => {
-                    let v = ibool(m.g(oa) == 0);
-                    m.set_g(oc, v);
+                    let v = ibool(g(s, oa) == 0);
+                    set(s, oc, v);
                 }
                 Op::AndF => {
-                    let v = fbool(float_true(m.g(oa)) && float_true(m.g(ob)));
-                    m.set_g(oc, v);
+                    let v = fbool(float_true(g(s, oa)) && float_true(g(s, ob)));
+                    set(s, oc, v);
                 }
                 Op::OrF => {
-                    let v = fbool(float_true(m.g(oa)) || float_true(m.g(ob)));
-                    m.set_g(oc, v);
+                    let v = fbool(float_true(g(s, oa)) || float_true(g(s, ob)));
+                    set(s, oc, v);
                 }
                 Op::BitAndF => {
-                    let v = (f2i(m.gf(oa)) & f2i(m.gf(ob))) as f32;
-                    m.set_gf(oc, v);
+                    let v = (f2i(gf(s, oa)) & f2i(gf(s, ob))) as f32;
+                    setf(s, oc, v);
                 }
                 Op::BitOrF => {
-                    let v = (f2i(m.gf(oa)) | f2i(m.gf(ob))) as f32;
-                    m.set_gf(oc, v);
+                    let v = (f2i(gf(s, oa)) | f2i(gf(s, ob))) as f32;
+                    setf(s, oc, v);
                 }
 
                 // ---- branches ------------------------------------------------------------
                 Op::IfI => {
-                    if m.g(oa) != 0 {
+                    if g(s, oa) != 0 {
                         jump!(st.b);
                     }
                     tick!();
                 }
                 Op::IfNotI => {
-                    if m.g(oa) == 0 {
+                    if g(s, oa) == 0 {
                         jump!(st.b);
                     }
                     tick!();
                 }
                 Op::IfF => {
-                    if float_true(m.g(oa)) {
+                    if float_true(g(s, oa)) {
                         jump!(st.b);
                     }
                     tick!();
                 }
                 Op::IfNotF => {
-                    if !float_true(m.g(oa)) {
+                    if !float_true(g(s, oa)) {
                         jump!(st.b);
                     }
                     tick!();
                 }
                 Op::IfS => {
-                    if m.g(oa) != 0 {
+                    if g(s, oa) != 0 {
                         jump!(st.b);
                     }
                     tick!();
                 }
                 Op::IfNotS => {
-                    if m.g(oa) == 0 {
+                    if g(s, oa) == 0 {
                         jump!(st.b);
                     }
                     tick!();
@@ -361,9 +371,9 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                 | Op::LoadFnc
                 | Op::LoadI
                 | Op::LoadP => {
-                    let (e, f) = (m.g(oa), m.g(ob));
-                    let v = match m.field_offset(e, f, 1) {
-                        Some(o) => m.ent_word(o),
+                    let (e, f) = (g(s, oa), g(s, ob));
+                    let v = match core.mem.field_offset(e, f, 1) {
+                        Some(o) => core.mem.ent_word(o),
                         None => {
                             core.x.pc = pc;
                             bad_field_access(core, e, f);
@@ -373,14 +383,14 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                     core.mem.set_g(oc, v);
                 }
                 Op::LoadV => {
-                    let (e, f) = (m.g(oa), m.g(ob));
-                    if let Some(o) = m.field_offset(e, f, 3) {
-                        for k in [0usize, 4, 8] {
-                            let v = m.ent_word(o.wrapping_add(k));
-                            m.set_g(oc.wrapping_add(k), v);
+                    let (e, f) = (g(s, oa), g(s, ob));
+                    if let Some(o) = core.mem.field_offset(e, f, 3) {
+                        let v = [0usize, 4, 8].map(|k| core.mem.ent_word(o.wrapping_add(k)));
+                        for (k, w) in [0usize, 4, 8].into_iter().zip(v) {
+                            core.mem.set_g(oc.wrapping_add(k), w);
                         }
                     } else {
-                        let entity_ok = e < m.num_edicts();
+                        let entity_ok = e < core.mem.num_edicts();
                         core.x.pc = pc;
                         bad_field_access(core, e, f);
                         // FTE: an invalid entity zeroes the whole vector, an invalid field only
@@ -392,13 +402,13 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                     }
                 }
                 Op::LoadI64 => {
-                    let (e, f) = (m.g(oa), m.g(ob));
-                    if let Some(o) = m.field_offset(e, f, 2) {
-                        let (lo, hi) = (m.ent_word(o), m.ent_word(o.wrapping_add(4)));
-                        m.set_g(oc, lo);
-                        m.set_g(oc.wrapping_add(4), hi);
+                    let (e, f) = (g(s, oa), g(s, ob));
+                    if let Some(o) = core.mem.field_offset(e, f, 2) {
+                        let (lo, hi) = (core.mem.ent_word(o), core.mem.ent_word(o.wrapping_add(4)));
+                        core.mem.set_g(oc, lo);
+                        core.mem.set_g(oc.wrapping_add(4), hi);
                     } else {
-                        let entity_ok = e < m.num_edicts();
+                        let entity_ok = e < core.mem.num_edicts();
                         let words: usize = if entity_ok {
                             1
                         } else if core.config.compat.load_i64_zero3 {
@@ -414,17 +424,17 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                     }
                 }
                 Op::Address => {
-                    let (e, f) = (m.g(oa), m.g(ob));
-                    if e >= m.num_edicts() {
+                    let (e, f) = (g(s, oa), g(s, ob));
+                    if e >= core.mem.num_edicts() {
                         core.x.pc = pc;
                         core.warn(WarningKind::BadEntity(e));
-                    } else if m.protected(e) {
-                        m.set_g(oc, u32::MAX);
+                    } else if core.mem.protected(e) {
+                        core.mem.set_g(oc, u32::MAX);
                         core.x.pc = pc;
                         core.warn(WarningKind::ReadOnlyEntity(e));
                     } else {
-                        let p = m.field_address(e, f);
-                        m.set_g(oc, p);
+                        let p = core.mem.field_address(e, f);
+                        core.mem.set_g(oc, p);
                     }
                 }
                 Op::StoreFieldF | Op::StoreFieldS | Op::StoreFieldI => {
@@ -448,18 +458,18 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                 | Op::StoreFnc
                 | Op::StoreI
                 | Op::StoreP => {
-                    let v = m.g(oa);
-                    m.set_g(ob, v);
+                    let v = g(s, oa);
+                    set(s, ob, v);
                 }
-                Op::StoreV => m.copy_g(oa, ob, 3),
-                Op::StoreI64 => m.copy_g(oa, ob, 2),
+                Op::StoreV => copy(s, oa, ob, 3),
+                Op::StoreI64 => copy(s, oa, ob, 2),
                 Op::StoreIF => {
-                    let v = m.g(oa).cast_signed() as f32;
-                    m.set_gf(ob, v);
+                    let v = g(s, oa).cast_signed() as f32;
+                    setf(s, ob, v);
                 }
                 Op::StoreFI => {
-                    let v = f2i(m.gf(oa)).cast_unsigned();
-                    m.set_g(ob, v);
+                    let v = f2i(gf(s, oa)).cast_unsigned();
+                    set(s, ob, v);
                 }
 
                 // ---- stores through pointers ---------------------------------------------
@@ -469,18 +479,18 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                 | Op::StorePFld
                 | Op::StorePFnc
                 | Op::StorePI => {
-                    let (v, base, idx) = (m.g(oa), m.g(ob), m.g(oc));
+                    let (v, base, idx) = (g(s, oa), g(s, ob), g(s, oc));
                     core.x.pc = pc;
                     if let Err(k) = ptr_write(core, base, idx.wrapping_mul(4), &v.to_le_bytes()) {
                         fault!(k);
                     }
                 }
                 Op::StorePV => {
-                    let (base, idx) = (m.g(ob), m.g(oc));
+                    let (base, idx) = (g(s, ob), g(s, oc));
                     let mut bytes = [0u8; 12];
                     for (k, chunk) in bytes.chunks_exact_mut(4).enumerate() {
                         chunk.copy_from_slice(
-                            &m.g(oa.wrapping_add(k.wrapping_mul(4))).to_le_bytes(),
+                            &g(s, oa.wrapping_add(k.wrapping_mul(4))).to_le_bytes(),
                         );
                     }
                     core.x.pc = pc;
@@ -489,7 +499,7 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                     }
                 }
                 Op::StorePI64 => {
-                    let (base, idx) = (m.g(ob), m.g(oc));
+                    let (base, idx) = (g(s, ob), g(s, oc));
                     let v = get64!(oa);
                     core.x.pc = pc;
                     if let Err(k) = ptr_write(core, base, idx.wrapping_mul(4), &v.to_le_bytes()) {
@@ -497,37 +507,37 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                     }
                 }
                 Op::StorePIF | Op::StorePFI => {
-                    let a = m.g(oa);
+                    let a = g(s, oa);
                     let v = if st.op == Op::StorePIF {
                         (a.cast_signed() as f32).to_bits()
                     } else {
                         f2i(f32::from_bits(a)).cast_unsigned()
                     };
-                    let (base, idx) = (m.g(ob), m.g(oc));
+                    let (base, idx) = (g(s, ob), g(s, oc));
                     core.x.pc = pc;
                     if let Err(k) = ptr_write(core, base, idx.wrapping_mul(4), &v.to_le_bytes()) {
                         fault!(k);
                     }
                 }
                 Op::StorePC => {
-                    let v = f2i(m.gf(oa)) as u8;
-                    let (base, idx) = (m.g(ob), m.g(oc));
+                    let v = f2i(gf(s, oa)) as u8;
+                    let (base, idx) = (g(s, ob), g(s, oc));
                     core.x.pc = pc;
                     if let Err(k) = ptr_write(core, base, idx, &[v]) {
                         fault!(k);
                     }
                 }
                 Op::StorePI8 => {
-                    let v = m.g(oa) as u8;
-                    let (base, idx) = (m.g(ob), m.g(oc));
+                    let v = g(s, oa) as u8;
+                    let (base, idx) = (g(s, ob), g(s, oc));
                     core.x.pc = pc;
                     if let Err(k) = ptr_write(core, base, idx, &[v]) {
                         fault!(k);
                     }
                 }
                 Op::StorePI16 => {
-                    let v = m.g(oa) as u16;
-                    let (base, idx) = (m.g(ob), m.g(oc));
+                    let v = g(s, oa) as u16;
+                    let (base, idx) = (g(s, ob), g(s, oc));
                     core.x.pc = pc;
                     if let Err(k) = ptr_write(core, base, idx.wrapping_mul(2), &v.to_le_bytes()) {
                         fault!(k);
@@ -541,7 +551,7 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                 | Op::LoadPFld
                 | Op::LoadPFnc
                 | Op::LoadPI => {
-                    let (base, idx) = (m.g(oa), m.g(ob));
+                    let (base, idx) = (g(s, oa), g(s, ob));
                     core.x.pc = pc;
                     match ptr_read::<4>(core, base, idx.wrapping_mul(4)) {
                         Ok(b) => core.mem.set_g(oc, u32::from_le_bytes(b)),
@@ -549,7 +559,7 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                     }
                 }
                 Op::LoadPV => {
-                    let (base, idx) = (m.g(oa), m.g(ob));
+                    let (base, idx) = (g(s, oa), g(s, ob));
                     core.x.pc = pc;
                     match ptr_read::<12>(core, base, idx.wrapping_mul(4)) {
                         Ok(b) => {
@@ -562,7 +572,7 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                     }
                 }
                 Op::LoadPI64 => {
-                    let (base, idx) = (m.g(oa), m.g(ob));
+                    let (base, idx) = (g(s, oa), g(s, ob));
                     core.x.pc = pc;
                     match ptr_read::<8>(core, base, idx.wrapping_mul(4)) {
                         Ok(b) => {
@@ -574,8 +584,8 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                     }
                 }
                 Op::LoadPC => {
-                    let base = m.g(oa);
-                    let idx = f2i(m.gf(ob)).cast_unsigned();
+                    let base = g(s, oa);
+                    let idx = f2i(gf(s, ob)).cast_unsigned();
                     core.x.pc = pc;
                     match ptr_read::<1>(core, base, idx) {
                         Ok([b]) => core.mem.set_gf(oc, f32::from(b)),
@@ -583,7 +593,7 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                     }
                 }
                 Op::LoadPU8 | Op::LoadPI8 => {
-                    let (base, idx) = (m.g(oa), m.g(ob));
+                    let (base, idx) = (g(s, oa), g(s, ob));
                     core.x.pc = pc;
                     match ptr_read::<1>(core, base, idx) {
                         Ok([b]) => {
@@ -598,7 +608,7 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                     }
                 }
                 Op::LoadPU16 | Op::LoadPI16 => {
-                    let (base, idx) = (m.g(oa), m.g(ob));
+                    let (base, idx) = (g(s, oa), g(s, ob));
                     core.x.pc = pc;
                     match ptr_read::<2>(core, base, idx.wrapping_mul(2)) {
                         Ok(b) => {
@@ -615,15 +625,15 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                 }
                 Op::LoadPItoF | Op::LoadPFtoI => {
                     // FTE: operand B is ignored and there is no fallback.
-                    let p = m.g(oa);
-                    match m.read_u32(p) {
+                    let p = g(s, oa);
+                    match core.mem.read_u32(p) {
                         Some(w) => {
                             let v = if st.op == Op::LoadPItoF {
                                 (w.cast_signed() as f32).to_bits()
                             } else {
                                 f2i(f32::from_bits(w)).cast_unsigned()
                             };
-                            m.set_g(oc, v);
+                            core.mem.set_g(oc, v);
                         }
                         None => fault!(ErrorKind::BadPointerRead(p)),
                     }
@@ -631,42 +641,42 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
 
                 // ---- Hexen 2 compound stores ---------------------------------------------
                 Op::MulStoreF => {
-                    let v = m.gf(ob) * m.gf(oa);
-                    m.set_gf(ob, v);
+                    let v = gf(s, ob) * gf(s, oa);
+                    setf(s, ob, v);
                 }
                 Op::DivStoreF => {
-                    let v = m.gf(ob) / m.gf(oa);
-                    m.set_gf(ob, v);
+                    let v = gf(s, ob) / gf(s, oa);
+                    setf(s, ob, v);
                 }
                 Op::AddStoreF => {
-                    let v = m.gf(ob) + m.gf(oa);
-                    m.set_gf(ob, v);
+                    let v = gf(s, ob) + gf(s, oa);
+                    setf(s, ob, v);
                 }
                 Op::SubStoreF => {
-                    let v = m.gf(ob) - m.gf(oa);
-                    m.set_gf(ob, v);
+                    let v = gf(s, ob) - gf(s, oa);
+                    setf(s, ob, v);
                 }
                 Op::MulStoreVF => {
-                    let f = m.gf(oa);
+                    let f = gf(s, oa);
                     for k in [0usize, 4, 8] {
-                        let v = m.gf(ob.wrapping_add(k)) * f;
-                        m.set_gf(ob.wrapping_add(k), v);
+                        let v = gf(s, ob.wrapping_add(k)) * f;
+                        setf(s, ob.wrapping_add(k), v);
                     }
                 }
                 Op::AddStoreV | Op::SubStoreV => {
                     for k in [0usize, 4, 8] {
-                        let (b, a) = (m.gf(ob.wrapping_add(k)), m.gf(oa.wrapping_add(k)));
+                        let (b, a) = (gf(s, ob.wrapping_add(k)), gf(s, oa.wrapping_add(k)));
                         let v = if st.op == Op::AddStoreV { b + a } else { b - a };
-                        m.set_gf(ob.wrapping_add(k), v);
+                        setf(s, ob.wrapping_add(k), v);
                     }
                 }
                 Op::BitSetStoreF => {
-                    let v = (f2i(m.gf(ob)) | f2i(m.gf(oa))) as f32;
-                    m.set_gf(ob, v);
+                    let v = (f2i(gf(s, ob)) | f2i(gf(s, oa))) as f32;
+                    setf(s, ob, v);
                 }
                 Op::BitClrStoreF => {
-                    let v = (f2i(m.gf(ob)) & !f2i(m.gf(oa))) as f32;
-                    m.set_gf(ob, v);
+                    let v = (f2i(gf(s, ob)) & !f2i(gf(s, oa))) as f32;
+                    setf(s, ob, v);
                 }
                 Op::MulStorePF
                 | Op::DivStorePF
@@ -686,28 +696,28 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                 // ---- Hexen 2 global arrays -----------------------------------------------
                 Op::FetchGblF | Op::FetchGblS | Op::FetchGblE | Op::FetchGblFnc | Op::FetchGblV => {
                     let base = st.a;
-                    let i = f2i(m.gf(ob));
+                    let i = f2i(gf(s, ob));
                     let Some(prefix_word) = base.checked_sub(1) else {
                         fault!(ErrorKind::ArrayIndex(i64::from(i)));
                     };
-                    let prefix = m.g(gb.wrapping_add(usize_from(prefix_word).wrapping_mul(4)));
+                    let prefix = g(s, gb.wrapping_add(usize_from(prefix_word).wrapping_mul(4)));
                     if i.cast_unsigned() > prefix {
                         fault!(ErrorKind::ArrayIndex(i64::from(i)));
                     }
                     let stride: u32 = if st.op == Op::FetchGblV { 3 } else { 1 };
                     let word = base.wrapping_add(i.cast_unsigned().wrapping_mul(stride));
                     let src = gb.wrapping_add(usize_from(word).wrapping_mul(4));
-                    m.copy_g(src, oc, usize_from(stride));
+                    copy(s, src, oc, usize_from(stride));
                 }
 
                 // ---- animation -----------------------------------------------------------
                 Op::State => {
-                    let op = StateOp::State { frame: m.gf(oa), think: FuncRef(m.g(ob)) };
+                    let op = StateOp::State { frame: gf(s, oa), think: FuncRef(g(s, ob)) };
                     core.x.pc = pc.wrapping_add(1);
                     return Exit::StateOp(op);
                 }
                 Op::CState | Op::CWState => {
-                    let (first, last) = (m.gf(oa), m.gf(ob));
+                    let (first, last) = (gf(s, oa), gf(s, ob));
                     let func = FuncRef::new(PrNum(prnum), core.x.func);
                     let op = if st.op == Op::CState {
                         StateOp::CState { first, last, func }
@@ -718,7 +728,7 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                     return Exit::StateOp(op);
                 }
                 Op::ThinkTime => {
-                    let op = StateOp::ThinkTime { ent: EntRef(m.g(oa)), delay: m.gf(ob) };
+                    let op = StateOp::ThinkTime { ent: EntRef(g(s, oa)), delay: gf(s, ob) };
                     core.x.pc = pc.wrapping_add(1);
                     return Exit::StateOp(op);
                 }
@@ -726,30 +736,30 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                 // ---- random --------------------------------------------------------------
                 Op::Rand0 | Op::Rand1 | Op::Rand2 => {
                     let r = core.rng.rand15() as f32 / 32768.0;
-                    let m = &mut core.mem;
+                    let s = core.mem.s.as_mut_slice();
                     let v = match st.op {
                         Op::Rand0 => r,
-                        Op::Rand1 => r * m.gf(oa),
+                        Op::Rand1 => r * gf(s, oa),
                         _ => {
-                            let (a, b) = (m.gf(oa), m.gf(ob));
+                            let (a, b) = (gf(s, oa), gf(s, ob));
                             a + r * (b - a)
                         }
                     };
-                    m.set_gf(oc, v);
+                    setf(s, oc, v);
                 }
                 Op::RandV0 | Op::RandV1 | Op::RandV2 => {
                     for k in [0usize, 4, 8] {
                         let r = core.rng.rand15() as f32 / 32767.0;
-                        let m = &mut core.mem;
+                        let s = core.mem.s.as_mut_slice();
                         let v = match st.op {
                             Op::RandV0 => r,
-                            Op::RandV1 => r * m.gf(oa.wrapping_add(k)),
+                            Op::RandV1 => r * gf(s, oa.wrapping_add(k)),
                             _ => {
-                                let (a, b) = (m.gf(oa.wrapping_add(k)), m.gf(ob.wrapping_add(k)));
+                                let (a, b) = (gf(s, oa.wrapping_add(k)), gf(s, ob.wrapping_add(k)));
                                 a + r * (b - a)
                             }
                         };
-                        m.set_gf(oc.wrapping_add(k), v);
+                        setf(s, oc.wrapping_add(k), v);
                     }
                 }
 
@@ -772,11 +782,11 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                 Op::Case => {
                     let r = usize_from(core.x.switch_ref);
                     let hit = match core.x.switch_kind {
-                        SwitchKind::Float => m.gf(r) == m.gf(oa),
-                        SwitchKind::Vector => m.gv(r) == m.gv(oa),
-                        SwitchKind::Int => m.g(r) == m.g(oa),
+                        SwitchKind::Float => gf(s, r) == gf(s, oa),
+                        SwitchKind::Vector => gv(s, r) == gv(s, oa),
+                        SwitchKind::Int => g(s, r) == g(s, oa),
                         SwitchKind::String => {
-                            let (a, b) = (m.g(r), m.g(oa));
+                            let (a, b) = (g(s, r), g(s, oa));
                             core.x.pc = pc;
                             strings_equal(core, a, b)
                         }
@@ -789,16 +799,16 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                     let r = usize_from(core.x.switch_ref);
                     let hit = match core.x.switch_kind {
                         SwitchKind::Float => {
-                            let v = m.gf(r);
-                            m.gf(oa) <= v && v <= m.gf(ob)
+                            let v = gf(s, r);
+                            gf(s, oa) <= v && v <= gf(s, ob)
                         }
                         SwitchKind::Vector => {
-                            let (v, lo, hi) = (m.gv(r), m.gv(oa), m.gv(ob));
+                            let (v, lo, hi) = (gv(s, r), gv(s, oa), gv(s, ob));
                             v.iter().zip(lo).zip(hi).all(|((v, lo), hi)| lo <= *v && *v <= hi)
                         }
                         SwitchKind::Int => {
-                            let v = m.g(r).cast_signed();
-                            m.g(oa).cast_signed() <= v && v <= m.g(ob).cast_signed()
+                            let v = g(s, r).cast_signed();
+                            g(s, oa).cast_signed() <= v && v <= g(s, ob).cast_signed()
                         }
                         SwitchKind::String => fault!(ErrorKind::StringCaseRange),
                     };
@@ -828,12 +838,12 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                     let argc = st.op.call_argc().unwrap_or(0);
                     if st.op.is_hexen2_call() {
                         if argc >= 2 {
-                            m.copy_g(oc, gb.wrapping_add(OFS_PARM1), 3);
+                            copy(s, oc, gb.wrapping_add(OFS_PARM1), 3);
                         }
-                        m.copy_g(ob, gb.wrapping_add(OFS_PARM0), 3);
+                        copy(s, ob, gb.wrapping_add(OFS_PARM0), 3);
                     }
                     tick!();
-                    let fv = m.g(oa);
+                    let fv = g(s, oa);
                     core.argc = u32::from(argc);
                     let target = FuncRef(fv);
                     let tp = target.progs();
@@ -865,7 +875,7 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                 }
                 Op::Return | Op::Done => {
                     tick!();
-                    m.copy_g(oa, gb.wrapping_add(OFS_RETURN), 3);
+                    copy(s, oa, gb.wrapping_add(OFS_RETURN), 3);
                     core.x.pc = pc;
                     core.leave();
                     if core.frames.len() <= exit_depth {
@@ -876,45 +886,45 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
 
                 // ---- integers ------------------------------------------------------------
                 Op::AddI => {
-                    let v = m.g(oa).wrapping_add(m.g(ob));
-                    m.set_g(oc, v);
+                    let v = g(s, oa).wrapping_add(g(s, ob));
+                    set(s, oc, v);
                 }
                 Op::SubI => {
-                    let v = m.g(oa).wrapping_sub(m.g(ob));
-                    m.set_g(oc, v);
+                    let v = g(s, oa).wrapping_sub(g(s, ob));
+                    set(s, oc, v);
                 }
                 Op::MulI => {
-                    let v = m.g(oa).wrapping_mul(m.g(ob));
-                    m.set_g(oc, v);
+                    let v = g(s, oa).wrapping_mul(g(s, ob));
+                    set(s, oc, v);
                 }
                 Op::DivI => {
-                    let (a, b) = (m.g(oa).cast_signed(), m.g(ob).cast_signed());
+                    let (a, b) = (g(s, oa).cast_signed(), g(s, ob).cast_signed());
                     let v = match a.checked_div(b) {
                         Some(v) => v,
                         None if b == 0 => 0,
                         None => i32::MAX,
                     };
-                    m.set_g(oc, v.cast_unsigned());
+                    set(s, oc, v.cast_unsigned());
                 }
                 Op::BitAndI => {
-                    let v = m.g(oa) & m.g(ob);
-                    m.set_g(oc, v);
+                    let v = g(s, oa) & g(s, ob);
+                    set(s, oc, v);
                 }
                 Op::BitOrI => {
-                    let v = m.g(oa) | m.g(ob);
-                    m.set_g(oc, v);
+                    let v = g(s, oa) | g(s, ob);
+                    set(s, oc, v);
                 }
                 Op::BitXorI => {
-                    let v = m.g(oa) ^ m.g(ob);
-                    m.set_g(oc, v);
+                    let v = g(s, oa) ^ g(s, ob);
+                    set(s, oc, v);
                 }
                 Op::RShiftI => {
-                    let v = m.g(oa).cast_signed().wrapping_shr(m.g(ob)).cast_unsigned();
-                    m.set_g(oc, v);
+                    let v = g(s, oa).cast_signed().wrapping_shr(g(s, ob)).cast_unsigned();
+                    set(s, oc, v);
                 }
                 Op::LShiftI => {
-                    let v = m.g(oa).wrapping_shl(m.g(ob));
-                    m.set_g(oc, v);
+                    let v = g(s, oa).wrapping_shl(g(s, ob));
+                    set(s, oc, v);
                 }
                 Op::EqI => cmp_i!(==),
                 Op::NeI => cmp_i!(!=),
@@ -923,67 +933,67 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                 Op::LtI => cmp_i!(<),
                 Op::GtI => cmp_i!(>),
                 Op::AndI => {
-                    let v = ibool(m.g(oa) != 0 && m.g(ob) != 0);
-                    m.set_g(oc, v);
+                    let v = ibool(g(s, oa) != 0 && g(s, ob) != 0);
+                    set(s, oc, v);
                 }
                 Op::OrI => {
-                    let v = ibool(m.g(oa) != 0 || m.g(ob) != 0);
-                    m.set_g(oc, v);
+                    let v = ibool(g(s, oa) != 0 || g(s, ob) != 0);
+                    set(s, oc, v);
                 }
                 Op::ConvItoF => {
-                    let v = m.g(oa).cast_signed() as f32;
-                    m.set_gf(oc, v);
+                    let v = g(s, oa).cast_signed() as f32;
+                    setf(s, oc, v);
                 }
                 Op::ConvFtoI => {
-                    let v = f2i(m.gf(oa)).cast_unsigned();
-                    m.set_g(oc, v);
+                    let v = f2i(gf(s, oa)).cast_unsigned();
+                    set(s, oc, v);
                 }
 
                 // ---- mixed int/float -----------------------------------------------------
                 Op::AddFI => {
-                    let v = m.gf(oa) + m.g(ob).cast_signed() as f32;
-                    m.set_gf(oc, v);
+                    let v = gf(s, oa) + g(s, ob).cast_signed() as f32;
+                    setf(s, oc, v);
                 }
                 Op::AddIF => {
-                    let v = m.g(oa).cast_signed() as f32 + m.gf(ob);
-                    m.set_gf(oc, v);
+                    let v = g(s, oa).cast_signed() as f32 + gf(s, ob);
+                    setf(s, oc, v);
                 }
                 Op::SubFI => {
-                    let v = m.gf(oa) - m.g(ob).cast_signed() as f32;
-                    m.set_gf(oc, v);
+                    let v = gf(s, oa) - g(s, ob).cast_signed() as f32;
+                    setf(s, oc, v);
                 }
                 Op::SubIF => {
-                    let v = m.g(oa).cast_signed() as f32 - m.gf(ob);
-                    m.set_gf(oc, v);
+                    let v = g(s, oa).cast_signed() as f32 - gf(s, ob);
+                    setf(s, oc, v);
                 }
                 Op::MulIF => {
-                    let v = m.g(oa).cast_signed() as f32 * m.gf(ob);
-                    m.set_gf(oc, v);
+                    let v = g(s, oa).cast_signed() as f32 * gf(s, ob);
+                    setf(s, oc, v);
                 }
                 Op::MulFI => {
-                    let v = m.gf(oa) * m.g(ob).cast_signed() as f32;
-                    m.set_gf(oc, v);
+                    let v = gf(s, oa) * g(s, ob).cast_signed() as f32;
+                    setf(s, oc, v);
                 }
                 Op::DivIF => {
-                    let v = m.g(oa).cast_signed() as f32 / m.gf(ob);
-                    m.set_gf(oc, v);
+                    let v = g(s, oa).cast_signed() as f32 / gf(s, ob);
+                    setf(s, oc, v);
                 }
                 Op::DivFI => {
-                    let v = m.gf(oa) / m.g(ob).cast_signed() as f32;
-                    m.set_gf(oc, v);
+                    let v = gf(s, oa) / g(s, ob).cast_signed() as f32;
+                    setf(s, oc, v);
                 }
                 Op::MulVI => {
-                    let i = m.g(ob).cast_signed() as f32;
+                    let i = g(s, ob).cast_signed() as f32;
                     for k in [0usize, 4, 8] {
-                        let v = m.gf(oa.wrapping_add(k)) * i;
-                        m.set_gf(oc.wrapping_add(k), v);
+                        let v = gf(s, oa.wrapping_add(k)) * i;
+                        setf(s, oc.wrapping_add(k), v);
                     }
                 }
                 Op::MulIV => {
-                    let i = m.g(oa).cast_signed() as f32;
+                    let i = g(s, oa).cast_signed() as f32;
                     for k in [0usize, 4, 8] {
-                        let v = i * m.gf(ob.wrapping_add(k));
-                        m.set_gf(oc.wrapping_add(k), v);
+                        let v = i * gf(s, ob.wrapping_add(k));
+                        setf(s, oc.wrapping_add(k), v);
                     }
                 }
                 Op::LeIF => cmp_if!(<=),
@@ -999,55 +1009,55 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                 Op::EqFI => cmp_fi!(==),
                 Op::NeFI => cmp_fi!(!=),
                 Op::BitAndIF => {
-                    let v = m.g(oa).cast_signed() & f2i(m.gf(ob));
-                    m.set_g(oc, v.cast_unsigned());
+                    let v = g(s, oa).cast_signed() & f2i(gf(s, ob));
+                    set(s, oc, v.cast_unsigned());
                 }
                 Op::BitOrIF => {
-                    let v = m.g(oa).cast_signed() | f2i(m.gf(ob));
-                    m.set_g(oc, v.cast_unsigned());
+                    let v = g(s, oa).cast_signed() | f2i(gf(s, ob));
+                    set(s, oc, v.cast_unsigned());
                 }
                 Op::BitAndFI => {
-                    let v = f2i(m.gf(oa)) & m.g(ob).cast_signed();
-                    m.set_g(oc, v.cast_unsigned());
+                    let v = f2i(gf(s, oa)) & g(s, ob).cast_signed();
+                    set(s, oc, v.cast_unsigned());
                 }
                 Op::BitOrFI => {
-                    let v = f2i(m.gf(oa)) | m.g(ob).cast_signed();
-                    m.set_g(oc, v.cast_unsigned());
+                    let v = f2i(gf(s, oa)) | g(s, ob).cast_signed();
+                    set(s, oc, v.cast_unsigned());
                 }
                 Op::AndIF => {
-                    let v = ibool(m.g(oa) != 0 && m.gf(ob) != 0.0);
-                    m.set_g(oc, v);
+                    let v = ibool(g(s, oa) != 0 && gf(s, ob) != 0.0);
+                    set(s, oc, v);
                 }
                 Op::OrIF => {
-                    let v = ibool(m.g(oa) != 0 || m.gf(ob) != 0.0);
-                    m.set_g(oc, v);
+                    let v = ibool(g(s, oa) != 0 || gf(s, ob) != 0.0);
+                    set(s, oc, v);
                 }
                 Op::AndFI => {
-                    let v = ibool(m.gf(oa) != 0.0 && m.g(ob) != 0);
-                    m.set_g(oc, v);
+                    let v = ibool(gf(s, oa) != 0.0 && g(s, ob) != 0);
+                    set(s, oc, v);
                 }
                 Op::OrFI => {
-                    let v = ibool(m.gf(oa) != 0.0 || m.g(ob) != 0);
-                    m.set_g(oc, v);
+                    let v = ibool(gf(s, oa) != 0.0 || g(s, ob) != 0);
+                    set(s, oc, v);
                 }
 
                 // ---- pointers, strings, indexed globals ----------------------------------
                 Op::GlobalAddress => {
-                    let word = st.a.wrapping_add(m.g(ob));
+                    let word = st.a.wrapping_add(g(s, ob));
                     let v = gbase_u32.wrapping_add(word.wrapping_mul(4));
-                    m.set_g(oc, v);
+                    set(s, oc, v);
                 }
                 Op::AddPIW => {
-                    let v = m.g(oa).wrapping_add(m.g(ob).wrapping_mul(4));
-                    m.set_g(oc, v);
+                    let v = g(s, oa).wrapping_add(g(s, ob).wrapping_mul(4));
+                    set(s, oc, v);
                 }
                 Op::AddSF => {
-                    let v = m.g(oa).wrapping_add(f2i(m.gf(ob)).cast_unsigned());
-                    m.set_g(oc, v);
+                    let v = g(s, oa).wrapping_add(f2i(gf(s, ob)).cast_unsigned());
+                    set(s, oc, v);
                 }
                 Op::SubS => {
-                    let v = m.g(oa).wrapping_sub(m.g(ob));
-                    m.set_g(oc, v);
+                    let v = g(s, oa).wrapping_sub(g(s, ob));
+                    set(s, oc, v);
                 }
                 Op::LoadAF
                 | Op::LoadAS
@@ -1062,12 +1072,12 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                         Op::LoadAI64 => 2,
                         _ => 1,
                     };
-                    let i = i64::from(st.a).wrapping_add(i64::from(m.g(ob).cast_signed()));
+                    let i = i64::from(st.a).wrapping_add(i64::from(g(s, ob).cast_signed()));
                     if i < 0 || i.saturating_add(i64::from(words)) > i64::from(ng) {
                         fault!(ErrorKind::ArrayIndex(i));
                     }
                     let src = gb.wrapping_add(usize::try_from(i).unwrap_or(0).wrapping_mul(4));
-                    m.copy_g(src, oc, usize_from(words));
+                    copy(s, src, oc, usize_from(words));
                 }
                 Op::GLoadI
                 | Op::GLoadF
@@ -1077,12 +1087,12 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                 | Op::GLoadFnc
                 | Op::GLoadV => {
                     let words: u32 = if st.op == Op::GLoadV { 3 } else { 1 };
-                    let i = m.g(oa).cast_signed();
+                    let i = g(s, oa).cast_signed();
                     if i < 0 || i64::from(i).saturating_add(i64::from(words)) > i64::from(ng) {
                         fault!(ErrorKind::ArrayIndex(i64::from(i)));
                     }
                     let src = gb.wrapping_add(usize_from(i.cast_unsigned()).wrapping_mul(4));
-                    m.copy_g(src, oc, usize_from(words));
+                    copy(s, src, oc, usize_from(words));
                 }
                 Op::GStorePI
                 | Op::GStorePF
@@ -1092,15 +1102,15 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                 | Op::GStorePFnc
                 | Op::GStorePV => {
                     let words: u32 = if st.op == Op::GStorePV { 3 } else { 1 };
-                    let i = m.g(ob).cast_signed();
+                    let i = g(s, ob).cast_signed();
                     if i < 0 || i64::from(i).saturating_add(i64::from(words)) > i64::from(ng) {
                         fault!(ErrorKind::ArrayIndex(i64::from(i)));
                     }
                     let dst = gb.wrapping_add(usize_from(i.cast_unsigned()).wrapping_mul(4));
-                    m.copy_g(oa, dst, usize_from(words));
+                    copy(s, oa, dst, usize_from(words));
                 }
                 Op::BoundCheck => {
-                    let v = m.g(oa);
+                    let v = g(s, oa);
                     if v < st.c || v >= st.b {
                         fault!(ErrorKind::BoundCheck {
                             value: v.cast_signed(),
@@ -1110,7 +1120,7 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                     }
                 }
                 Op::Push => {
-                    let words = m.g(oa);
+                    let words = g(s, oa);
                     let word = core.x.ls_top.wrapping_add(core.x.pushed);
                     let addr = core.mem.ls_base.wrapping_add(word.wrapping_mul(4));
                     let pushed = core.x.pushed.saturating_add(words);
@@ -1126,28 +1136,28 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
 
                 // ---- unsigned ------------------------------------------------------------
                 Op::LeU => {
-                    let v = ibool(m.g(oa) <= m.g(ob));
-                    m.set_g(oc, v);
+                    let v = ibool(g(s, oa) <= g(s, ob));
+                    set(s, oc, v);
                 }
                 Op::LtU => {
-                    let v = ibool(m.g(oa) < m.g(ob));
-                    m.set_g(oc, v);
+                    let v = ibool(g(s, oa) < g(s, ob));
+                    set(s, oc, v);
                 }
                 Op::DivU => {
-                    let v = m.g(oa).checked_div(m.g(ob)).unwrap_or(0);
-                    m.set_g(oc, v);
+                    let v = g(s, oa).checked_div(g(s, ob)).unwrap_or(0);
+                    set(s, oc, v);
                 }
                 Op::RShiftU => {
-                    let v = m.g(oa).wrapping_shr(m.g(ob));
-                    m.set_g(oc, v);
+                    let v = g(s, oa).wrapping_shr(g(s, ob));
+                    set(s, oc, v);
                 }
                 Op::ConvUF => {
-                    let v = m.g(oa) as f32;
-                    m.set_gf(oc, v);
+                    let v = g(s, oa) as f32;
+                    setf(s, oc, v);
                 }
                 Op::ConvFU => {
-                    let v = f2u(m.gf(oa));
-                    m.set_g(oc, v);
+                    let v = f2u(gf(s, oa));
+                    set(s, oc, v);
                 }
 
                 // ---- 64-bit integers -----------------------------------------------------
@@ -1162,7 +1172,7 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                 Op::BitXorI64 => i64_op!(|a, b| a ^ b),
                 Op::LShiftI64I | Op::RShiftI64I | Op::RShiftU64I => {
                     let a = get64!(oa);
-                    let n = m.g(ob);
+                    let n = g(s, ob);
                     let v = match st.op {
                         Op::LShiftI64I => a.wrapping_shl(n),
                         Op::RShiftI64I => a.cast_signed().wrapping_shr(n).cast_unsigned(),
@@ -1181,31 +1191,31 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                     set64!(oc, a.checked_div(b).unwrap_or(0));
                 }
                 Op::ConvUI64 => {
-                    let v = u64::from(m.g(oa));
+                    let v = u64::from(g(s, oa));
                     set64!(oc, v);
                 }
                 Op::ConvII64 => {
-                    let v = i64::from(m.g(oa).cast_signed()).cast_unsigned();
+                    let v = i64::from(g(s, oa).cast_signed()).cast_unsigned();
                     set64!(oc, v);
                 }
                 Op::ConvI64I => {
-                    let v = m.g(oa);
-                    m.set_g(oc, v);
+                    let v = g(s, oa);
+                    set(s, oc, v);
                 }
                 Op::ConvI64F => {
                     let v = get64!(oa).cast_signed() as f32;
-                    m.set_gf(oc, v);
+                    setf(s, oc, v);
                 }
                 Op::ConvU64F => {
                     let v = get64!(oa) as f32;
-                    m.set_gf(oc, v);
+                    setf(s, oc, v);
                 }
                 Op::ConvFI64 => {
-                    let v = d2i64(f64::from(m.gf(oa))).cast_unsigned();
+                    let v = d2i64(f64::from(gf(s, oa))).cast_unsigned();
                     set64!(oc, v);
                 }
                 Op::ConvFU64 => {
-                    let v = d2u64(f64::from(m.gf(oa)));
+                    let v = d2u64(f64::from(gf(s, oa)));
                     set64!(oc, v);
                 }
 
@@ -1219,12 +1229,12 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                 Op::EqD => d_cmp!(==),
                 Op::NeD => d_cmp!(!=),
                 Op::ConvFD => {
-                    let v = f64::from(m.gf(oa)).to_bits();
+                    let v = f64::from(gf(s, oa)).to_bits();
                     set64!(oc, v);
                 }
                 Op::ConvDF => {
                     let v = f64::from_bits(get64!(oa)) as f32;
-                    m.set_gf(oc, v);
+                    setf(s, oc, v);
                 }
                 Op::ConvI64D => {
                     let v = (get64!(oa).cast_signed() as f64).to_bits();
@@ -1245,7 +1255,7 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
 
                 // ---- bitfields -----------------------------------------------------------
                 Op::BitExtendI | Op::BitExtendU => {
-                    let (a, d) = (m.g(oa), m.g(ob));
+                    let (a, d) = (g(s, oa), g(s, ob));
                     let (w, p) = (d & 0xFF, d >> 8);
                     let v = if w == 0 {
                         0
@@ -1258,18 +1268,59 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
                             up.wrapping_shr(down)
                         }
                     };
-                    m.set_g(oc, v);
+                    set(s, oc, v);
                 }
                 Op::BitCopyI => {
-                    let (a, d, c) = (m.g(oa), m.g(ob), m.g(oc));
+                    let (a, d, c) = (g(s, oa), g(s, ob), g(s, oc));
                     let (w, p) = (d & 0xFF, d >> 8);
                     let mask = if w >= 32 { u32::MAX } else { (1u32 << w).wrapping_sub(1) };
                     let v = (c & !mask.wrapping_shl(p)) | (a & mask).wrapping_shl(p);
-                    m.set_g(oc, v);
+                    set(s, oc, v);
                 }
             }
             pc = pc.wrapping_add(1);
         }
+    }
+}
+
+/// Reads a word of region S.
+#[inline(always)]
+fn g(s: &[u8], o: usize) -> u32 {
+    crate::bytes::u32_at(s, o).unwrap_or(0)
+}
+
+/// Reads a float of region S.
+#[inline(always)]
+fn gf(s: &[u8], o: usize) -> f32 {
+    f32::from_bits(g(s, o))
+}
+
+/// Reads a vector of region S.
+#[inline(always)]
+fn gv(s: &[u8], o: usize) -> [f32; 3] {
+    [gf(s, o), gf(s, o.wrapping_add(4)), gf(s, o.wrapping_add(8))]
+}
+
+/// Writes a word of region S (the loader guarantees operands are in range; stray writes are
+/// dropped).
+#[inline(always)]
+fn set(s: &mut [u8], o: usize, v: u32) {
+    crate::bytes::put_u32(s, o, v);
+}
+
+/// Writes a float of region S.
+#[inline(always)]
+fn setf(s: &mut [u8], o: usize, v: f32) {
+    set(s, o, v.to_bits());
+}
+
+/// Copies words within region S in increasing order (overlap-exact, like FTE).
+#[inline(always)]
+fn copy(s: &mut [u8], src: usize, dst: usize, words: usize) {
+    for i in 0..words {
+        let k = i.wrapping_mul(4);
+        let v = g(s, src.wrapping_add(k));
+        set(s, dst.wrapping_add(k), v);
     }
 }
 
