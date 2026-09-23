@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Every source-like file in the repository must carry the SPDX licence header.
+//! Every source-like file in the repository must carry the SPDX licence header and use LF line
+//! endings.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::support::tools::repo_root;
 
@@ -16,43 +17,73 @@ const SKIP_DIRS: &[&str] = &["target", ".git", ".idea", ".claude", "corpus", "ar
 const SKIP_FILES: &[&str] = &["LICENSE-MIT", "LICENSE-APACHE", "Cargo.lock"];
 
 const CHECKED_EXTENSIONS: &[&str] =
-    &["rs", "toml", "md", "qc", "qh", "src", "ps1", "sh", "py", "yml", "yaml"];
+    &["rs", "toml", "md", "qc", "qh", "src", "ps1", "sh", "py", "yml", "yaml", "expected"];
 
-fn needs_header(path: &Path) -> bool {
+fn is_text(path: &Path) -> bool {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if SKIP_FILES.contains(&name) {
-        return false;
-    }
     name == ".gitignore"
         || name == ".gitattributes"
+        || SKIP_FILES.contains(&name)
         || path
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| CHECKED_EXTENSIONS.contains(&e))
 }
 
-fn walk(dir: &Path, missing: &mut Vec<String>) {
+fn needs_header(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    is_text(path) && !SKIP_FILES.contains(&name) && ext != "expected"
+}
+
+/// Text files in the repository.
+fn text_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if path.is_dir() {
             if !SKIP_DIRS.contains(&name) {
-                walk(&path, missing);
+                text_files(&path, out);
             }
-        } else if needs_header(&path) {
-            let text = fs::read_to_string(&path).unwrap_or_default();
-            let head: String = text.lines().take(3).collect::<Vec<_>>().join("\n");
-            if !head.contains(SPDX) {
-                missing.push(path.strip_prefix(repo_root()).unwrap().display().to_string());
-            }
+        } else if is_text(&path) {
+            out.push(path);
         }
     }
 }
 
+fn rel(path: &Path) -> String {
+    path.strip_prefix(repo_root()).unwrap().display().to_string()
+}
+
 #[test]
 fn every_file_has_an_spdx_header() {
-    let mut missing = Vec::new();
-    walk(repo_root(), &mut missing);
+    let mut files = Vec::new();
+    text_files(repo_root(), &mut files);
+    let mut missing: Vec<String> = files
+        .iter()
+        .filter(|p| needs_header(p))
+        .filter(|p| {
+            let text = fs::read_to_string(p).unwrap_or_default();
+            let head: String = text.lines().take(3).collect::<Vec<_>>().join("\n");
+            !head.contains(SPDX)
+        })
+        .map(|p| rel(p))
+        .collect();
     missing.sort();
     assert!(missing.is_empty(), "files without `{SPDX}`:\n  {}", missing.join("\n  "));
+}
+
+/// Line feeds only: no carriage returns (Windows line endings), and no raw NUL bytes (escape
+/// them in literals).
+#[test]
+fn text_files_use_lf_line_endings() {
+    let mut files = Vec::new();
+    text_files(repo_root(), &mut files);
+    let mut bad: Vec<String> = files
+        .iter()
+        .filter(|p| fs::read(p).unwrap().iter().any(|&b| b == b'\r' || b == 0))
+        .map(|p| rel(p))
+        .collect();
+    bad.sort();
+    assert!(bad.is_empty(), "files with CR or NUL bytes:\n  {}", bad.join("\n  "));
 }
