@@ -183,6 +183,8 @@ impl<H: Host> Vm<H> {
         let mut ran = 0usize;
         let mut queue = due.into_iter();
         while let Some(thread) = queue.next() {
+            // Each resumed thread is a host call of its own.
+            self.start_budgets();
             self.core.nesting = self.core.nesting.saturating_add(1);
             let result = self.resume(host, &thread);
             self.core.nesting = self.core.nesting.saturating_sub(1);

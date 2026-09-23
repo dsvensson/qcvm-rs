@@ -58,6 +58,8 @@ pub enum ErrorKind {
     TooManyArguments(usize),
     /// The instruction budget ran out (an infinite loop, most likely).
     Runaway,
+    /// The host call ran past [`Limits::deadline`](crate::Limits::deadline).
+    Deadline,
     /// Read through an invalid pointer.
     BadPointerRead(u32),
     /// Wrote through an invalid pointer.
@@ -111,6 +113,7 @@ impl fmt::Display for ErrorKind {
             Self::Reentrancy => f.write_str("too many nested calls into QuakeC"),
             Self::TooManyArguments(n) => write!(f, "{n} arguments passed; QuakeC takes at most 8"),
             Self::Runaway => f.write_str("runaway loop error"),
+            Self::Deadline => f.write_str("deadline exceeded"),
             Self::BadPointerRead(p) => write!(f, "bad pointer read ({p:#x})"),
             Self::BadPointerWrite(p) => write!(f, "bad pointer write ({p:#x})"),
             Self::NullPointerWrite => f.write_str("null pointer write"),

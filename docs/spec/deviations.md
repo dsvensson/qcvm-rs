@@ -32,6 +32,7 @@ production code should leave them off.
 | `CSTATE`/`CWSTATE` think function | stored without the progs byte | keeps the progs byte (multiprogs-safe) | — |
 | `STOREP_*` into a read-only entity via a stale pointer | allowed | warns and skips the store | — |
 | Resumed `sleep`/`fork` threads | restore `self`/`other` by entity number | validate against a spawn serial; a reused slot resumes as world | — |
+| Runaway budget | a fresh budget for every nested execution (a builtin calling back into QuakeC starts over) | one budget per host call, shared by the calls builtins make back into QuakeC; optionally a wall-clock deadline | — |
 
 ## Builtins
 

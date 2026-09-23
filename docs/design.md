@@ -124,7 +124,8 @@ notification. Every method has a default, so a host implements only what it supp
 ## Limits
 
 `Limits` bounds everything QuakeC controls: entities, heap, temp strings (count and bytes),
-local stack, call depth, re-entrancy, instructions per host call (the runaway counter), progs,
+local stack, call depth, re-entrancy, instructions per host call (the runaway counter, shared
+with the calls builtins make back into QuakeC, and an optional wall-clock deadline), progs,
 threads (count and snapshot memory), string buffers and hash tables (count, entries, and one
 shared memory budget for their contents and the token list), JSON trees (by the heap), warnings
 per call. Exceeding one is an error or a refused operation with a warning, never an abort or an

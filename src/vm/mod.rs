@@ -99,6 +99,11 @@ pub struct Vm<H> {
     builtins: Arc<Builtins<H>>,
     started: Instant,
     realtime: Option<f64>,
+    /// Instruction budget left for the current host call, shared by nested calls. Kept out of
+    /// [`Core`], which the interpreter works on, to leave its layout alone.
+    budget: u32,
+    /// When the current host call has to finish ([`Limits::deadline`]).
+    deadline: Option<Instant>,
 }
 
 impl<H: Host> fmt::Debug for Vm<H> {
@@ -110,6 +115,9 @@ impl<H: Host> fmt::Debug for Vm<H> {
             .finish_non_exhaustive()
     }
 }
+
+/// Instructions the interpreter runs between deadline checks.
+const BUDGET_CHUNK: u32 = 1 << 16;
 
 // A VM moves between threads with its host (engines run it off their render thread): keep it
 // `Send` for any `Send` host.
@@ -130,7 +138,15 @@ impl<H: Host> Vm<H> {
         config: VmConfig,
     ) -> Result<Self, VmError> {
         let core = build_core(Arc::clone(&program), &builtins, config)?;
-        Ok(Self { core, main: program, builtins, started: Instant::now(), realtime: None })
+        Ok(Self {
+            core,
+            main: program,
+            builtins,
+            started: Instant::now(),
+            realtime: None,
+            budget: 0,
+            deadline: None,
+        })
     }
 
     /// Restores the VM to its freshly loaded state: globals re-initialised, entities and temp
@@ -325,6 +341,7 @@ impl<H: Host> Vm<H> {
         if top_level {
             self.core.warnings_this_call = 0;
             self.core.suppressed = 0;
+            self.start_budgets();
         }
         let saved = (self.core.argc, self.core.builtin);
         // QuakeC callees take their arguments from the calling context's PARM slots (entering a
@@ -471,16 +488,44 @@ impl<H: Host> Vm<H> {
         result
     }
 
+    /// Starts the budgets of a host call: the instruction budget that nested calls share, and
+    /// the deadline.
+    fn start_budgets(&mut self) {
+        let limits = &self.core.config.limits;
+        self.budget = limits.runaway;
+        self.deadline = limits.deadline.and_then(|d| Instant::now().checked_add(d));
+    }
+
     fn execute_inner(&mut self, host: &mut H, exit_depth: usize) -> Result<(), VmError> {
-        let mut budget = self.core.config.limits.runaway;
         loop {
+            // With a deadline the interpreter gets the shared budget in chunks, so the deadline
+            // is checked between them.
+            let chunk =
+                if self.deadline.is_some() { self.budget.min(BUDGET_CHUNK) } else { self.budget };
+            let mut left = chunk;
             let exit = if self.core.trace {
-                interp::run::<true>(&mut self.core, exit_depth, &mut budget)
+                interp::run::<true>(&mut self.core, exit_depth, &mut left)
             } else {
                 self.core.traced = false;
-                interp::run::<false>(&mut self.core, exit_depth, &mut budget)
+                interp::run::<false>(&mut self.core, exit_depth, &mut left)
             };
+            if !matches!(exit, Exit::Budget) {
+                self.budget = self.budget.saturating_sub(chunk.saturating_sub(left));
+            }
             match exit {
+                Exit::Budget => {
+                    if self.budget <= chunk {
+                        self.budget = 0;
+                        self.flush_warnings(host);
+                        return Err(self.fail(ErrorKind::Runaway.into(), exit_depth));
+                    }
+                    // The count that ran out is taken again when the statement runs.
+                    self.budget = self.budget.saturating_sub(chunk.saturating_sub(1));
+                    if self.deadline.is_some_and(|d| Instant::now() >= d) {
+                        self.flush_warnings(host);
+                        return Err(self.fail(ErrorKind::Deadline.into(), exit_depth));
+                    }
+                }
                 Exit::Returned => {
                     self.flush_warnings(host);
                     return Ok(());

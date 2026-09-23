@@ -822,3 +822,97 @@ fn overlapping_vector_pointer_copies() {
         assert_eq!(words, [1.0, 1.0, 2.0, 3.0], "{name}");
     }
 }
+
+/// A builtin that runs the host's callback function (a QuakeC loop) once.
+fn b_run_callback(vm: &mut Vm<TestHost>, host: &mut TestHost) -> Result<(), VmError> {
+    let f = host.callback.unwrap();
+    vm.call(host, f, &[])?;
+    Ok(())
+}
+
+/// A function of `gotos` jumps to the next statement and a `DONE`: `gotos + 1` counted
+/// instructions.
+fn straight_line(asm: &mut Asm, name: &str, gotos: u32) {
+    asm.function(name, &[], 0);
+    for _ in 0..gotos {
+        let at = asm.emit(Op::Goto, 0, 0, 0);
+        asm.patch_jump(at, 0, at + 1);
+    }
+    asm.emit(Op::Done, 0, 0, 0);
+}
+
+/// The runaway budget is exact across the chunks the interpreter runs in, and calls builtins make
+/// back into QuakeC share their host call's budget.
+#[test]
+fn runaway_budget_is_exact_and_shared() {
+    let mut asm = Asm::new();
+    straight_line(&mut asm, "fits", 69_998);
+    straight_line(&mut asm, "too_long", 69_999);
+    straight_line(&mut asm, "work", 999);
+    let b = asm.builtin("run_callback", 1, 0);
+    let b_g = asm.global("run_callback_g", ty::FUNCTION, &[b]);
+    asm.function("many", &[], 0);
+    for _ in 0..10 {
+        asm.emit(Op::Call0, b_g, 0, 0);
+    }
+    asm.emit(Op::Done, 0, 0, 0);
+    let program = Arc::new(Program::parse(&asm.build(ProgsFormat::Fte32)).unwrap());
+    let mut config = VmConfig::default();
+    config.limits.runaway = 70_000;
+    let mut b = Builtins::empty(Numbering::None);
+    b.set_numbered(1, "run_callback", b_run_callback);
+    let mut vm: Vm<TestHost> = Vm::new(program, Arc::new(b), config).unwrap();
+    let mut host = TestHost::default();
+    // 69,999 counted instructions fit a budget of 70,000; the 70,000th is refused. With a
+    // deadline the budget is handed out in chunks of 65,536, and stays exact across them.
+    vm.call(&mut host, func(&vm, "fits"), &[]).unwrap();
+    let err = vm.call(&mut host, func(&vm, "too_long"), &[]).unwrap_err();
+    assert_eq!(*err.kind(), ErrorKind::Runaway);
+    let mut chunked = vm.config().clone();
+    chunked.limits.deadline = Some(std::time::Duration::from_secs(3600));
+    let mut b = Builtins::empty(Numbering::None);
+    b.set_numbered(1, "run_callback", b_run_callback);
+    let mut cvm: Vm<TestHost> = Vm::new(Arc::clone(vm.program()), Arc::new(b), chunked).unwrap();
+    cvm.call(&mut host, func(&cvm, "fits"), &[]).unwrap();
+    let err = cvm.call(&mut host, func(&cvm, "too_long"), &[]).unwrap_err();
+    assert_eq!(*err.kind(), ErrorKind::Runaway);
+
+    // Ten nested runs of 1,000 each exceed a budget of 5,000 between them.
+    host.callback = Some(func(&vm, "work"));
+    vm.call(&mut host, func(&vm, "many"), &[]).unwrap();
+    let mut config = vm.config().clone();
+    config.limits.runaway = 5_000;
+    let program = Arc::clone(vm.program());
+    let mut b = Builtins::empty(Numbering::None);
+    b.set_numbered(1, "run_callback", b_run_callback);
+    let mut vm: Vm<TestHost> = Vm::new(program, Arc::new(b), config).unwrap();
+    host.callback = Some(func(&vm, "work"));
+    let err = vm.call(&mut host, func(&vm, "many"), &[]).unwrap_err();
+    assert_eq!(*err.kind(), ErrorKind::Runaway);
+    // The next host call starts with a full budget again.
+    vm.call(&mut host, func(&vm, "work"), &[]).unwrap();
+}
+
+/// A deadline stops a call that would otherwise run for a long time.
+#[test]
+fn deadline_stops_long_calls() {
+    let mut asm = Asm::new();
+    asm.function("spin", &[], 0);
+    let l = asm.emit(Op::Goto, 0, 0, 0);
+    asm.patch_jump(l, 0, l);
+    let program = Arc::new(Program::parse(&asm.build(ProgsFormat::Fte16)).unwrap());
+    let mut config = VmConfig::default();
+    config.limits.runaway = u32::MAX;
+    config.limits.deadline = Some(std::time::Duration::from_millis(50));
+    let mut vm: Vm<TestHost> =
+        Vm::new(program, Arc::new(Builtins::empty(Numbering::None)), config).unwrap();
+    let mut host = TestHost::default();
+    let started = std::time::Instant::now();
+    let err = vm.call(&mut host, func(&vm, "spin"), &[]).unwrap_err();
+    assert_eq!(*err.kind(), ErrorKind::Deadline);
+    let took = started.elapsed();
+    assert!(
+        took >= std::time::Duration::from_millis(50) && took < std::time::Duration::from_secs(5),
+        "{took:?}"
+    );
+}

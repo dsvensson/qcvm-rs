@@ -12,8 +12,12 @@ pub struct Limits {
     pub local_stack_words: u32,
     /// Maximum QuakeC call depth (FTE: 1024).
     pub call_depth: u32,
-    /// Instruction budget per call, counted at jumps, calls and returns (FTE: 100,000,000).
+    /// Instruction budget of a host call, counted at jumps, calls and returns (FTE: 100,000,000).
+    /// Calls that builtins make back into QuakeC draw on the same budget.
     pub runaway: u32,
+    /// Wall-clock time a host call may take, including the calls builtins make back into
+    /// QuakeC; checked every 65,536 counted instructions. `None` (the default): no deadline.
+    pub deadline: Option<std::time::Duration>,
     /// Maximum nesting of builtin → QuakeC → builtin calls. Each level takes about 1 KiB of
     /// native stack in optimised builds (unoptimised builds need far more), plus what the host's
     /// builtins use.
@@ -52,6 +56,7 @@ impl Default for Limits {
             local_stack_words: 1 << 20,
             call_depth: 1024,
             runaway: 100_000_000,
+            deadline: None,
             reentry: 64,
             heap_bytes: 64 << 20,
             temp_strings: 1 << 20,

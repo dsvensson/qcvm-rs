@@ -69,6 +69,9 @@ pub(crate) enum Exit {
     StateOp(StateOp),
     /// Tracing: the statement at `core.x.pc` is about to run and should be reported first.
     Trace,
+    /// The budget given to this run is spent. The statement at `core.x.pc` has had no effect
+    /// and runs again when the caller resumes with more budget.
+    Budget,
     /// A fatal error.
     Fault(ErrorKind),
 }
@@ -106,7 +109,9 @@ pub(crate) fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget:
                 *budget = budget.saturating_sub(1);
                 if *budget == 0 {
                     core.x.pc = pc;
-                    return Exit::Fault(ErrorKind::Runaway);
+                    // Already reported: it runs again, but should not be traced twice.
+                    core.traced = TRACE;
+                    return Exit::Budget;
                 }
             }};
         }
@@ -844,6 +849,8 @@ pub(crate) fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget:
                 | Op::Call6H
                 | Op::Call7H
                 | Op::Call8H => {
+                    // Count first: a statement the budget stops must have had no effect yet.
+                    tick!();
                     let argc = st.op.call_argc().unwrap_or(0);
                     if st.op.is_hexen2_call() {
                         if argc >= 2 {
@@ -851,7 +858,6 @@ pub(crate) fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget:
                         }
                         copy(s, ob, gb.wrapping_add(OFS_PARM0), 3);
                     }
-                    tick!();
                     let fv = g(s, oa);
                     core.argc = u32::from(argc);
                     let target = FuncRef(fv);
