@@ -818,31 +818,22 @@ fn csprogs_predicts_a_thousand_frames_of_fire() {
     let sounds = fire_rockets(&mut c, 1000);
 
     // One predicted shot per refire interval (0.8 s at 60 fps = 48 frames), matching the server
-    // shot for shot, except the server's first shot, which came before any snapshot.
-    //
-    // A shot may sound on several consecutive frames: KTX's weapon_state.qc writes
-    // `frame_may_sound = (f <= threshold) && (f > last_sound_frame);`, which QuakeC's operator
-    // precedence (fteqcc without `-Fcpriority`) parses as `(frame_may_sound = f <= threshold) &&
-    // ...`, so the replay repeats a shot's effects until a snapshot includes it. FTE runs the
-    // progs the same way. The checks below hold with or without that quirk.
-    let bursts: Vec<i32> = sounds
-        .iter()
-        .enumerate()
-        .filter(|&(i, &f)| i == 0 || sounds[i - 1] != f - 1)
-        .map(|(_, &f)| f)
-        .collect();
-    assert_eq!(bursts.len() as u32 + 1, c.server.shots, "{sounds:?}");
-    for w in bursts.windows(2) {
-        assert!((48..=49).contains(&(w[1] - w[0])), "shots {bursts:?}");
+    // shot for shot, except the server's first shot, which came before any snapshot. Replay walks
+    // the same input frames every render, so this also checks that a shot's effects fire once.
+    // (Builds of weapon_state.qc before the fix of `frame_may_sound = (a) && (b)`, which
+    // QuakeC's precedence parsed as `(frame_may_sound = a) && b`, repeated them for ~10 frames.)
+    assert_eq!(sounds.len() as u32 + 1, c.server.shots, "{sounds:?}");
+    for w in sounds.windows(2) {
+        assert!((48..=49).contains(&(w[1] - w[0])), "shots {sounds:?}");
     }
-    // Every predicted shot spawned a local rocket; they expire in their predraw (removing
-    // themselves mid-walk) after about four frames.
+    // Every predicted shot spawned one local rocket; they expire in their predraw (removing
+    // themselves mid-walk) after about four frames, long before the next shot.
     let spawned =
         c.host.log.iter().filter(|l| l.starts_with("setmodel") && l.ends_with("missile.mdl"));
     assert_eq!(spawned.count(), sounds.len());
     let is_local = c.vm.field::<f32>("is_local").unwrap();
     let alive = c.vm.entities().filter(|&e| c.vm.get_field(e, is_local) == Some(1.0)).count();
-    assert!(alive <= 4, "{alive} local rockets still alive");
+    assert!(alive <= 1, "{alive} local rockets still alive");
 
     // Once the first snapshot has arrived (frame 6) we draw the view weapon ourselves; before
     // that the engine's is used.
@@ -890,17 +881,11 @@ fn csprogs_suppresses_the_servers_echo_of_a_predicted_sound() {
         .unwrap()
         .f32()
     };
-    // The host's copy of the sample name (a temp string) matches the progs' constant. Each
-    // predicted play left one token (see the note on repeated shots above), and each echo
-    // consumes one.
+    // The host's copy of the sample name (a temp string) matches the progs' constant; the
+    // predicted play left one token, which the first echo consumes.
+    assert_eq!(sounds.len(), 1, "{sounds:?}");
     assert_eq!(event(&mut c, ROCKET_SOUND), 1.0, "echo of the predicted shot is dropped");
-    let mut dropped = 1;
-    while event(&mut c, ROCKET_SOUND) == 1.0 {
-        dropped += 1;
-        assert!(dropped <= 8, "more echoes dropped than tokens exist");
-    }
-    assert_eq!(dropped, sounds.len().min(8), "one token per predicted play");
-    assert_eq!(event(&mut c, ROCKET_SOUND), 0.0, "the tokens were consumed");
+    assert_eq!(event(&mut c, ROCKET_SOUND), 0.0, "the token was consumed");
     assert_eq!(event(&mut c, b"weapons/grenade.wav"), 0.0, "sounds not predicted play");
 }
 
