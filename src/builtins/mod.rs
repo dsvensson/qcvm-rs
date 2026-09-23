@@ -96,7 +96,7 @@ impl<H: Host> Builtins<H> {
     /// Registers (or replaces) builtin `name`. Its number comes from the registry's numbering
     /// table; builtins without a number there bind by name only.
     pub fn set(&mut self, name: &str, func: BuiltinFn<H>) -> &mut Self {
-        let number = numbers::lookup(self.numbering, name);
+        let number = builtin_number(self.numbering, name);
         self.insert(name.as_bytes(), number, func);
         self
     }
@@ -169,14 +169,42 @@ impl<H: Host> Builtins<H> {
     }
 }
 
-/// FTE's builtin numbers per VM kind (filled in with the standard library).
-pub(crate) mod numbers {
-    use super::Numbering;
+mod numbers;
 
-    pub(crate) fn lookup(numbering: Numbering, name: &str) -> Option<u32> {
-        let table: &[(&str, u32)] = match numbering {
-            Numbering::Csqc | Numbering::Ssqc | Numbering::Menu | Numbering::None => &[],
-        };
-        table.iter().find(|(n, _)| *n == name).map(|&(_, num)| num)
+/// FTE's builtin number for `name` under `numbering`, if it has one. Builtins FTE resolves by
+/// name (`= #0:name`) have none.
+#[must_use]
+pub fn builtin_number(numbering: Numbering, name: &str) -> Option<u32> {
+    let table: &[(&str, u32)] = match numbering {
+        Numbering::Csqc => numbers::CSQC,
+        Numbering::Ssqc => numbers::SSQC,
+        Numbering::Menu => numbers::MENU,
+        Numbering::None => &[],
+    };
+    let found = table.binary_search_by(|(n, _)| (*n).cmp(name)).ok().and_then(|i| table.get(i));
+    found.map(|&(_, number)| number).or_else(|| extra_number(numbering, name))
+}
+
+/// Every builtin FTE declares for `numbering`: numbered ones with their number, name-resolved
+/// ones (`= #0:name`) with `None`.
+#[must_use]
+pub fn known_builtins(numbering: Numbering) -> Vec<(&'static str, Option<u32>)> {
+    let (table, named): (&[(&str, u32)], &[&str]) = match numbering {
+        Numbering::Csqc => (numbers::CSQC, numbers::CSQC_NAMED),
+        Numbering::Ssqc => (numbers::SSQC, numbers::SSQC_NAMED),
+        Numbering::Menu => (numbers::MENU, numbers::MENU_NAMED),
+        Numbering::None => (&[], &[]),
+    };
+    let mut out: Vec<_> = table.iter().map(|&(n, num)| (n, Some(num))).collect();
+    out.extend(named.iter().map(|&n| (n, None)));
+    out
+}
+
+/// Builtins in FTE's tables that the platform dump does not declare for that VM kind.
+fn extra_number(numbering: Numbering, name: &str) -> Option<u32> {
+    match (numbering, name) {
+        (Numbering::Csqc, "fork") => Some(210),
+        (Numbering::Csqc, "sleep") => Some(212),
+        _ => None,
     }
 }

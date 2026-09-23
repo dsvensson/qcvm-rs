@@ -3,4 +3,5 @@
 //! Shared helpers for the integration tests.
 
 pub mod asm;
+pub mod harness;
 pub mod tools;

@@ -85,7 +85,7 @@ const fn align_up(v: usize, align: usize) -> Option<usize> {
 ///
 /// See the crate documentation for an overview.
 pub struct Vm<H> {
-    core: Core,
+    pub(crate) core: Core,
     main: Arc<Program>,
     builtins: Arc<Builtins<H>>,
     started: Instant,
@@ -1081,6 +1081,7 @@ fn build_core<H: Host>(
         suppressed: 0,
         trace: false,
         remove_clears,
+        std: crate::stdlib::StdState::default(),
         config,
     })
 }

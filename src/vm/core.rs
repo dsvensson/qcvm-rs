@@ -195,6 +195,8 @@ pub(crate) struct Core {
     pub(crate) trace: bool,
     /// Field words zeroed by `remove`.
     pub(crate) remove_clears: Vec<u32>,
+    /// State of the standard builtins (tokens, hash tables, string buffers).
+    pub(crate) std: crate::stdlib::StdState,
 }
 
 impl Core {

@@ -17,12 +17,13 @@ pub mod error;
 pub mod host;
 pub mod opcode;
 pub mod progs;
+pub mod stdlib;
 pub mod value;
 pub mod vm;
 
 pub use builtins::{BuiltinFn, Builtins, Numbering};
 pub use error::{ErrorKind, VmError, Warning, WarningKind};
-pub use host::{Host, NullHost};
+pub use host::{CalendarTime, CvarInfo, DumpKind, Host, NullHost};
 pub use opcode::Op;
 pub use progs::{LoadError, LoadNote, Program, ProgsFormat};
 pub use value::{
