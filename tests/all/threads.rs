@@ -95,3 +95,20 @@ fn sleep_fork_and_nested_sleeps() {
                     loop done\nmain continues\nparent after fork\nnested 103\nforked child at 5\n";
     assert_eq!(String::from_utf8_lossy(&host.0), expected);
 }
+
+/// Suspended threads are limited by the memory their snapshots hold.
+#[test]
+fn thread_memory_is_limited() {
+    let Some(compiled) = compile(&["threads.qc"], &["-Tfte"]) else { return };
+    let program = Arc::new(Program::parse(&compiled.dat).unwrap());
+    let mut b = Builtins::standard(Numbering::Ssqc);
+    b.set_numbered(1, "puts", puts).set_numbered(2, "ftos", ftos).set_numbered(211, "abort", abort);
+    let mut config = VmConfig::ssqc();
+    config.limits.thread_bytes = 8;
+    let mut vm = Vm::new(program, Arc::new(b), config).unwrap();
+    let mut host = Out::default();
+    let main = vm.find_function("main").unwrap();
+    let err = vm.call(&mut host, main, &[]).unwrap_err();
+    assert_eq!(*err.kind(), qcvm::ErrorKind::OutOfMemory(qcvm::error::Resource::Threads));
+    assert_eq!(vm.sleeping_threads(), 0);
+}

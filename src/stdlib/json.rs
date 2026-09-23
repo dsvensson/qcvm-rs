@@ -20,6 +20,7 @@
 //! decoded). `\uXXXX` escapes in strings are decoded to UTF-8 (a NUL as the overlong `C0 80`).
 
 use crate::builtins::Builtins;
+use crate::bytes::usize_from;
 use crate::error::VmError;
 use crate::host::Host;
 use crate::vm::Vm;
@@ -57,12 +58,54 @@ const MAX_DEPTH: u32 = 256;
 
 // ---- parsing ----------------------------------------------------------------------------------
 
+/// A byte range of the input.
+#[derive(Clone, Copy, Debug)]
+struct Span {
+    start: u32,
+    end: u32,
+}
+
+impl Span {
+    fn len(self) -> usize {
+        usize_from(self.end.saturating_sub(self.start))
+    }
+
+    fn of(self, data: &[u8]) -> &[u8] {
+        data.get(usize_from(self.start)..usize_from(self.end)).unwrap_or_default()
+    }
+}
+
+/// A node's name in its parent.
+#[derive(Clone, Copy, Debug)]
+enum Name {
+    Root,
+    /// An object key, verbatim.
+    Key(Span),
+    /// An array element, named by its index.
+    Index(u32),
+}
+
+impl Name {
+    /// Bytes the name takes in the VM layout (with its NUL; empty names are null).
+    fn layout_len(self) -> usize {
+        match self {
+            Self::Root => 0,
+            Self::Key(s) if s.len() == 0 => 0,
+            Self::Key(s) => s.len().saturating_add(1),
+            Self::Index(i) => {
+                let digits = i.checked_ilog10().map_or(1, |d| d.saturating_add(1));
+                usize_from(digits).saturating_add(1)
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Kind {
     /// A string, with its escapes still encoded.
-    Str(Vec<u8>),
+    Str(Span),
     /// A number (or any other unquoted word), as written.
-    Num(Vec<u8>),
+    Num(Span),
     Object,
     Array,
     True,
@@ -72,14 +115,39 @@ enum Kind {
 
 #[derive(Debug)]
 struct Node {
-    name: Vec<u8>,
+    name: Name,
     kind: Kind,
     children: Vec<Node>,
+}
+
+/// Why a document was not parsed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Failure {
+    /// Not (FTE-flavoured) JSON.
+    Invalid,
+    /// Its VM layout would exceed the limit.
+    TooLarge,
+}
+
+/// A parsed document: the root (childless unless built) and the VM layout's node count and name
+/// bytes.
+#[derive(Debug)]
+struct Parsed {
+    root: Node,
+    nodes: usize,
+    names: usize,
 }
 
 struct Parser<'a> {
     data: &'a [u8],
     pos: usize,
+    /// Keep the tree; otherwise only validate and measure the document.
+    build: bool,
+    nodes: usize,
+    names: usize,
+    /// Most bytes the VM layout (nodes and names) may take.
+    limit: usize,
+    too_large: bool,
 }
 
 impl Parser<'_> {
@@ -93,6 +161,11 @@ impl Parser<'_> {
 
     fn bump(&mut self) {
         self.pos = self.pos.saturating_add(1);
+    }
+
+    fn span(&self, start: usize) -> Span {
+        let to = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
+        Span { start: to(start), end: to(self.pos) }
     }
 
     /// Skips whitespace and C/C++ comments.
@@ -129,7 +202,7 @@ impl Parser<'_> {
     }
 
     /// A quoted string (the body, escapes undecoded) or an unquoted word.
-    fn token(&mut self) -> Option<(Vec<u8>, bool)> {
+    fn token(&mut self) -> Option<(Span, bool)> {
         if self.peek() == Some(b'"') {
             self.bump();
             let start = self.pos;
@@ -148,7 +221,7 @@ impl Parser<'_> {
             if self.peek() != Some(b'"') {
                 return None;
             }
-            let body = self.data.get(start..self.pos).unwrap_or_default().to_vec();
+            let body = self.span(start);
             self.bump();
             Some((body, true))
         } else {
@@ -156,13 +229,21 @@ impl Parser<'_> {
             while self.peek().is_some_and(|c| !b" \t\r\n:,{}[]".contains(&c)) {
                 self.bump();
             }
-            let word = self.data.get(start..self.pos).unwrap_or_default();
-            (!word.is_empty()).then(|| (word.to_vec(), false))
+            (self.pos > start).then(|| (self.span(start), false))
         }
     }
 
-    fn node(&mut self, name: Vec<u8>, depth: u32) -> Option<Node> {
-        if depth > MAX_DEPTH {
+    /// Counts a node against the layout limit.
+    fn measure(&mut self, name: Name) -> bool {
+        self.nodes = self.nodes.saturating_add(1);
+        self.names = self.names.saturating_add(name.layout_len());
+        let size = self.nodes.saturating_mul(NODE).saturating_add(self.names);
+        self.too_large = size > self.limit;
+        !self.too_large
+    }
+
+    fn node(&mut self, name: Name, depth: u32) -> Option<Node> {
+        if depth > MAX_DEPTH || !self.measure(name) {
             return None;
         }
         self.skip_white();
@@ -177,8 +258,9 @@ impl Parser<'_> {
                     self.skip_white();
                     if self.peek() == Some(b':') {
                         self.bump();
-                        match self.node(key, depth.saturating_add(1)) {
-                            Some(child) => node.children.push(child),
+                        match self.node(Name::Key(key), depth.saturating_add(1)) {
+                            Some(child) if self.build => node.children.push(child),
+                            Some(_) => {}
                             None => break,
                         }
                     }
@@ -190,7 +272,7 @@ impl Parser<'_> {
                     }
                     break;
                 }
-                (self.peek() == Some(b'}')).then(|| {
+                (self.peek() == Some(b'}') && !self.too_large).then(|| {
                     self.bump();
                     node
                 })
@@ -199,12 +281,13 @@ impl Parser<'_> {
                 self.bump();
                 self.skip_white();
                 node.kind = Kind::Array;
-                let mut index = 0usize;
+                let mut index = 0u32;
                 loop {
-                    let name = index.to_string().into_bytes();
+                    let name = Name::Index(index);
                     index = index.saturating_add(1);
                     match self.node(name, depth.saturating_add(1)) {
-                        Some(child) => node.children.push(child),
+                        Some(child) if self.build => node.children.push(child),
+                        Some(_) => {}
                         None => break,
                     }
                     if self.peek() == Some(b',') {
@@ -215,20 +298,21 @@ impl Parser<'_> {
                     break;
                 }
                 self.skip_white();
-                (self.peek() == Some(b']')).then(|| {
+                (self.peek() == Some(b']') && !self.too_large).then(|| {
                     self.bump();
                     node
                 })
             }
             _ => {
                 let (text, quoted) = self.token()?;
+                let word = text.of(self.data);
                 node.kind = if quoted {
                     Kind::Str(text)
-                } else if text.eq_ignore_ascii_case(b"true") {
+                } else if word.eq_ignore_ascii_case(b"true") {
                     Kind::True
-                } else if text.eq_ignore_ascii_case(b"false") {
+                } else if word.eq_ignore_ascii_case(b"false") {
                     Kind::False
-                } else if text.eq_ignore_ascii_case(b"null") {
+                } else if word.eq_ignore_ascii_case(b"null") {
                     Kind::Null
                 } else {
                     Kind::Num(text)
@@ -239,13 +323,21 @@ impl Parser<'_> {
     }
 }
 
-/// Parses a whole document (trailing garbage fails it).
-fn parse(data: &[u8]) -> Option<Node> {
+/// Parses a whole document (trailing garbage fails it) whose VM layout takes at most `limit`
+/// bytes. With `build` false nothing is allocated: the document is only validated and measured.
+fn parse(data: &[u8], build: bool, limit: usize) -> Result<Parsed, Failure> {
+    if u32::try_from(data.len()).is_err() {
+        return Err(Failure::TooLarge);
+    }
     let pos = if data.starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
-    let mut p = Parser { data, pos };
-    let root = p.node(Vec::new(), 0);
+    let mut p = Parser { data, pos, build, nodes: 0, names: 0, limit, too_large: false };
+    let root = p.node(Name::Root, 0);
     p.skip_white();
-    if p.pos == data.len() { root } else { None }
+    match root {
+        _ if p.too_large => Err(Failure::TooLarge),
+        Some(root) if p.pos == data.len() => Ok(Parsed { root, nodes: p.nodes, names: p.names }),
+        _ => Err(Failure::Invalid),
+    }
 }
 
 fn hex(c: u8) -> Option<u32> {
@@ -444,19 +536,10 @@ pub(crate) fn c_atoi(s: &[u8]) -> i32 {
 
 // ---- layout -----------------------------------------------------------------------------------
 
-/// Counts nodes and name bytes (each non-empty name plus its NUL).
-fn count(node: &Node, nodes: &mut usize, names: &mut usize) {
-    *nodes = nodes.saturating_add(1);
-    if !node.name.is_empty() {
-        *names = names.saturating_add(node.name.len()).saturating_add(1);
-    }
-    for c in &node.children {
-        count(c, nodes, names);
-    }
-}
-
 struct Layout<'a, H: Host> {
     vm: &'a mut Vm<H>,
+    /// The document text the tree's spans refer to.
+    data: &'a [u8],
     /// The block being built; `base` is its VM address.
     out: Vec<u8>,
     base: u32,
@@ -477,21 +560,31 @@ impl<H: Host> Layout<'_, H> {
 
     fn node(&mut self, node: &Node, slot: usize) -> Result<(), VmError> {
         let at = slot.saturating_mul(NODE);
-        if !node.name.is_empty() {
+        let index;
+        let name = match node.name {
+            Name::Root => &[][..],
+            Name::Key(key) => key.of(self.data),
+            Name::Index(i) => {
+                index = i.to_string();
+                index.as_bytes()
+            }
+        };
+        if !name.is_empty() {
             let name_at = self.next_name;
-            self.put(name_at, &node.name);
-            self.next_name = name_at.saturating_add(node.name.len()).saturating_add(1);
+            self.put(name_at, name);
+            self.next_name = name_at.saturating_add(name.len()).saturating_add(1);
             let r = self.addr(name_at);
             self.put(at.saturating_add(4), &r.to_le_bytes());
         }
         let number = |v: f64| v.to_le_bytes();
         let ty = match &node.kind {
             Kind::Str(body) => {
-                let s = self.vm.temp(&unescape(body))?;
+                let s = self.vm.temp(&unescape(body.of(self.data)))?;
                 self.put(at.saturating_add(8), &s.0.to_le_bytes());
                 TYPE_STRING
             }
             Kind::Num(text) => {
+                let text = text.of(self.data);
                 // FTE reads at most 63 characters.
                 let v = c_atof(text.get(..text.len().min(63)).unwrap_or_default());
                 self.put(at.saturating_add(8), &number(v));
@@ -572,12 +665,21 @@ fn node_arg<H: Host>(vm: &mut Vm<H>, i: usize) -> Result<NodeView, VmError> {
 /// root node, or null if the text is not valid (FTE-flavoured) JSON.
 pub fn json_parse<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
     let text = vm.arg_str(0).to_vec();
-    let Some(root) = parse(&text) else {
-        vm.ret_raw([0; 3]);
-        return Ok(());
+    // Validate and measure first, allocating nothing, so a document whose layout cannot fit the
+    // heap costs no memory; only then build the tree.
+    let limit = usize_from(vm.core.config.limits.heap_bytes);
+    let parsed = match parse(&text, false, limit).and_then(|_| parse(&text, true, limit)) {
+        Ok(parsed) => parsed,
+        Err(Failure::Invalid) => {
+            vm.ret_raw([0; 3]);
+            return Ok(());
+        }
+        Err(Failure::TooLarge) => {
+            vm.ret_raw([0; 3]);
+            return soft_error(vm, "json_parse: out of memory");
+        }
     };
-    let (mut nodes, mut names) = (0usize, 0usize);
-    count(&root, &mut nodes, &mut names);
+    let Parsed { root, nodes, names } = parsed;
     let size = nodes.saturating_mul(NODE).saturating_add(names);
     let Some(base) = u32::try_from(size).ok().and_then(|n| heap_alloc(&mut vm.core, n)) else {
         vm.ret_raw([0; 3]);
@@ -590,7 +692,8 @@ pub fn json_parse<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError>
         return soft_error(vm, "json_parse: out of memory");
     }
     out.resize(size, 0);
-    let mut layout = Layout { vm, out, base, next_node: 1, next_name: nodes.saturating_mul(NODE) };
+    let next_name = nodes.saturating_mul(NODE);
+    let mut layout = Layout { vm, data: &text, out, base, next_node: 1, next_name };
     let laid_out = layout.node(&root, 0);
     let Layout { vm, out, .. } = layout;
     if let Err(e) = laid_out {
@@ -695,6 +798,7 @@ pub fn json_get_child_at_index<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
 mod tests {
     use super::*;
 
@@ -724,17 +828,41 @@ mod tests {
         assert_eq!(unescape(b"end\\"), b"end\\");
     }
 
+    fn valid(data: &[u8]) -> bool {
+        let checked = parse(data, false, usize::MAX).is_ok();
+        assert_eq!(parse(data, true, usize::MAX).is_ok(), checked);
+        checked
+    }
+
     #[test]
     fn grammar() {
-        assert!(parse(b"").is_none());
-        assert!(parse(b"{}").is_some());
-        assert!(parse(b"[1,]").is_some());
-        assert!(parse(b"{\"a\":1,}").is_some());
-        assert!(parse(b"[1 2]").is_none());
-        assert!(parse(b"{} x").is_none());
-        assert!(parse(b"\xEF\xBB\xBF // hi\n /* c */ [true, NULL, False]").is_some());
-        assert!(parse(b"\"unterminated").is_none());
+        assert!(!valid(b""));
+        assert!(valid(b"{}"));
+        assert!(valid(b"[1,]"));
+        assert!(valid(b"{\"a\":1,}"));
+        assert!(!valid(b"[1 2]"));
+        assert!(!valid(b"{} x"));
+        assert!(valid(b"\xEF\xBB\xBF // hi\n /* c */ [true, NULL, False]"));
+        assert!(!valid(b"\"unterminated"));
         let deep = [b'['; 1000];
-        assert!(parse(&deep).is_none());
+        assert!(!valid(&deep));
+    }
+
+    /// The layout size is known without building anything, and exceeding the limit stops the
+    /// parse early.
+    #[test]
+    fn layout_size_and_limit() {
+        let doc = br#"{"ab": [1, "x"], "": null}"#;
+        let p = parse(doc, false, usize::MAX).unwrap();
+        assert!(p.root.children.is_empty(), "nothing is built when measuring");
+        // Root, "ab", its two elements and the empty-named null: 5 nodes; names "ab", "0", "1".
+        assert_eq!((p.nodes, p.names), (5, 3 + 2 + 2));
+        let built = parse(doc, true, usize::MAX).unwrap();
+        assert_eq!(built.root.children.len(), 2);
+        let size = 5 * NODE + 7;
+        assert!(parse(doc, false, size).is_ok());
+        assert_eq!(parse(doc, false, size - 1).unwrap_err(), Failure::TooLarge);
+        let wide = format!("[{}]", "0,".repeat(100_000));
+        assert_eq!(parse(wide.as_bytes(), true, 64 * 1024).unwrap_err(), Failure::TooLarge);
     }
 }

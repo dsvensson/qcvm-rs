@@ -2,7 +2,7 @@
 
 //! tokenize, tokenize_console, tokenizebyseparator, argv and friends (docs/spec/strings.md).
 
-use qcvm::Arg;
+use qcvm::{Arg, Numbering};
 
 use super::{eq, harness, opt_s};
 use crate::support::harness::{Harness, b, f, s};
@@ -169,4 +169,25 @@ fn tokenizebyseparator_examples() {
     assert_eq!(names(t(&seven)), ["1", "2", "3", "4", "5", "6", "7", "8"]);
     // Bytes are compared as they are.
     assert_eq!(t(&[b(b"x\xFFy"), b(b"\xFF")]).len(), 2);
+}
+
+/// The token list shares the container budget: long lists of empty or one-byte tokens stop at
+/// it (with a warning), stay so after collections, and give their storage back when replaced.
+#[test]
+fn token_lists_are_bounded() {
+    let limits = qcvm::Limits { container_bytes: 8 * 1024, ..qcvm::Limits::default() };
+    let config = qcvm::VmConfig { limits, ..qcvm::VmConfig::default() };
+    let mut h = Harness::with(Numbering::Csqc, config, Harness::named(&["argc"]));
+    let commas = ",".repeat(4096);
+    let n = h.f("tokenizebyseparator", &[s(&commas), s(",")]);
+    assert!(n > 10.0 && n < 4097.0, "{n}");
+    assert!(!h.host.warnings.is_empty());
+    h.vm.collect_garbage().unwrap();
+    assert_eq!(h.f("argc", &[]), n);
+    let letters = "a ".repeat(4096);
+    let m = h.f("tokenize", &[s(&letters)]);
+    assert!(m > 10.0 && m < 4096.0, "{m}");
+    // Replacing the list releases its storage: the whole budget is available again.
+    assert_eq!(h.f("tokenize", &[s("x y")]), 2.0);
+    assert!(h.f("hash_createtab", &[f(64.0)]) > 0.0);
 }

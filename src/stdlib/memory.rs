@@ -462,6 +462,10 @@ pub fn base64encode<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmErro
         _ => None,
     };
     match data {
+        // Four characters per three bytes; refuse before encoding what could not be stored.
+        Some(d) if !vm.core.strings.fits(d.len().div_ceil(3).saturating_mul(4)) => Err(
+            VmError::new(crate::error::ErrorKind::OutOfMemory(crate::error::Resource::TempStrings)),
+        ),
         Some(d) => vm.ret_str(&base64_encode(&d)),
         None => {
             vm.ret_raw([0; 3]);

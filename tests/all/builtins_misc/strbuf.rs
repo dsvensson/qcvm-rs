@@ -221,3 +221,57 @@ fn cvarlist_and_loadfile_use_the_host() {
     );
     assert_eq!(h.f("buf_loadfile", &[s("lines.txt"), f(99.0)]), 0.0);
 }
+
+/// Hash tables and string buffers share one memory budget (`Limits::container_bytes`): adds
+/// beyond it fail with a warning, and freeing gives the room back.
+#[test]
+fn hash_tables_and_buffers_share_a_memory_budget() {
+    let limits = Limits { container_bytes: 16 * 1024, ..Limits::default() };
+    let config = VmConfig { limits, ..VmConfig::default() };
+    let mut h = Harness::with(Numbering::Csqc, config, |_| {});
+
+    // A table of 65,536 buckets needs far more than 16 KiB.
+    assert_eq!(h.f("hash_createtab", &[f(65536.0)]), 0.0);
+    let t = h.f("hash_createtab", &[f(16.0), f(1.0)]);
+    assert!(t > 0.0);
+
+    let big = "x".repeat(6000);
+    let b = h.f("buf_create", &[]);
+    assert_eq!(h.f("bufstr_add", &[f(b), s(&big), f(1.0)]), 0.0);
+    assert_eq!(h.f("bufstr_add", &[f(b), s(&big), f(1.0)]), 1.0);
+    assert_eq!(h.f("bufstr_add", &[f(b), s(&big), f(1.0)]), -1.0, "over budget");
+    h.call("hash_add", &[f(t), s("key"), s(&big)]).unwrap();
+    assert!(h.call("hash_get", &[f(t), s("key")]).unwrap().str_ref().is_null(), "not stored");
+    assert!(!warnings(&h).is_empty());
+
+    // Freeing an entry makes room again.
+    h.call("bufstr_free", &[f(b), f(0.0)]).unwrap();
+    h.call("hash_add", &[f(t), s("key"), s(&big)]).unwrap();
+    let r = h.call("hash_get", &[f(t), s("key")]).unwrap().str_ref();
+    assert_eq!(h.vm.str(r).len(), 6000);
+    // Deleting the buffer and the table returns everything.
+    h.call("buf_del", &[f(b)]).unwrap();
+    h.call("hash_destroytab", &[f(t)]).unwrap();
+    assert!(h.f("hash_createtab", &[f(64.0)]) > 0.0);
+    let b = h.f("buf_create", &[]);
+    assert_eq!(h.f("bufstr_add", &[f(b), s(&big), f(1.0)]), 0.0);
+}
+
+/// `buf_implode` sizes its result (the glue repeats once per entry) before building it, and
+/// refuses one the temp strings have no room for.
+#[test]
+fn buf_implode_refuses_oversized_results_up_front() {
+    let limits = Limits { temp_string_bytes: 64 * 1024, ..Limits::default() };
+    let config = VmConfig { limits, ..VmConfig::default() };
+    let mut h = Harness::with(Numbering::Csqc, config, |_| {});
+    let b = h.f("buf_create", &[]);
+    for _ in 0..64 {
+        h.call("bufstr_add", &[f(b), s("x"), f(1.0)]).unwrap();
+    }
+    let glue = "-".repeat(4096);
+    let err = h.call("buf_implode", &[f(b), s(&glue)]).unwrap_err();
+    assert_eq!(*err.kind(), qcvm::ErrorKind::OutOfMemory(qcvm::error::Resource::TempStrings));
+    // A result that fits is still built.
+    let r = h.call("buf_implode", &[f(b), s(",")]).unwrap().str_ref();
+    assert_eq!(h.vm.str(r).len(), 64 + 63);
+}

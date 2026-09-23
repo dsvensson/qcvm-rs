@@ -16,7 +16,7 @@ use crate::vm::Vm;
 use crate::vm::num::f2i;
 
 use super::introspect::{set_fte, soft_error};
-use super::util::{arg_int, opt_f32};
+use super::util::{arg_int, charge, opt_f32, recharge, release};
 
 /// Registers this module's builtins.
 pub(crate) fn register<H: Host>(b: &mut Builtins<H>) {
@@ -58,17 +58,46 @@ struct Entry {
     value: Value,
 }
 
+/// Storage charged per bucket (see [`crate::Limits::container_bytes`]).
+const BUCKET_BYTES: usize = size_of::<Vec<Entry>>();
+
+impl Entry {
+    /// Storage charged for the entry.
+    fn bytes(&self) -> usize {
+        entry_bytes(&self.key, &self.value)
+    }
+}
+
+/// Storage charged for an entry: its key and text, and four entry slots of its bucket. A
+/// bucket's capacity never exceeds four times its entries (`Vec` at most doubles it when
+/// growing, and [`Table::remove`] shrinks buckets that fall below half full), so this covers
+/// the slack that removals leave behind.
+fn entry_bytes(key: &[u8], value: &Value) -> usize {
+    let text = match value {
+        Value::Text(t) => t.len(),
+        Value::Words(_) => 0,
+    };
+    size_of::<Entry>().saturating_mul(4).saturating_add(key.len()).saturating_add(text)
+}
+
 /// One hash table.
 #[derive(Clone, Debug)]
 struct Table {
     default_ty: i32,
     /// Buckets, each with its newest entry last.
     buckets: Vec<Vec<Entry>>,
+    /// Storage the table holds: its buckets and entries.
+    bytes: usize,
 }
 
 impl Table {
     fn new(buckets: usize, default_ty: i32) -> Self {
-        Self { default_ty, buckets: vec![Vec::new(); buckets.max(1)] }
+        let buckets = buckets.max(1);
+        Self {
+            default_ty,
+            buckets: vec![Vec::new(); buckets],
+            bytes: buckets.saturating_mul(BUCKET_BYTES),
+        }
     }
 
     fn bucket_of(&self, key: &[u8]) -> usize {
@@ -96,7 +125,14 @@ impl Table {
 
     fn remove(&mut self, (b, i): (usize, usize)) -> Option<Entry> {
         let bucket = self.buckets.get_mut(b)?;
-        (i < bucket.len()).then(|| bucket.remove(i))
+        let entry = (i < bucket.len()).then(|| bucket.remove(i))?;
+        // Give back capacity once the bucket is less than half full, so the storage charged per
+        // entry stays an upper bound.
+        if bucket.capacity() > bucket.len().saturating_mul(2) {
+            bucket.shrink_to_fit();
+        }
+        self.bytes = self.bytes.saturating_sub(entry.bytes());
+        Some(entry)
     }
 
     /// Every entry in enumeration order: bucket by bucket, newest first within a bucket.
@@ -154,19 +190,25 @@ fn ret_value<H: Host>(vm: &mut Vm<H>, value: &Value) -> Result<(), VmError> {
 
 /// `hashtable hash_createtab(float size, optional float type = EV_VECTOR)`: a new table
 /// (`size` below 4 means 64 buckets; type 0 means `EV_VECTOR`). Returns 0 when the table limit
-/// is reached.
+/// or the memory limit is reached.
 pub fn hash_createtab<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
     let size = arg_int(vm, 0);
     let ty = if vm.argc() > 1 { arg_int(vm, 1) } else { EV_VECTOR };
     let ty = if ty == 0 { EV_VECTOR } else { ty };
     let buckets = if size < 4 { 64 } else { usize::try_from(size).unwrap_or(64).min(MAX_BUCKETS) };
     let limit = usize::try_from(vm.core.config.limits.hash_tables).unwrap_or(usize::MAX);
-    let tables = &mut vm.core.std.hash;
-    if tables.live() >= limit {
+    if vm.core.std.hash.live() >= limit {
         vm.ret_f32(0.0);
         return Ok(());
     }
-    let table = Some(Table::new(buckets, ty));
+    let table = Table::new(buckets, ty);
+    if !charge(&mut vm.core, table.bytes) {
+        vm.warn("hash_createtab: out of memory for hash tables and string buffers");
+        vm.ret_f32(0.0);
+        return Ok(());
+    }
+    let tables = &mut vm.core.std.hash;
+    let table = Some(table);
     let index = match tables.tables.iter().position(Option::is_none) {
         Some(i) => {
             if let Some(slot) = tables.tables.get_mut(i) {
@@ -187,12 +229,13 @@ pub fn hash_createtab<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmEr
 /// destroyed).
 pub fn hash_destroytab<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
     let Some(handle) = table_arg(vm, 0)? else { return Ok(()) };
-    if let Some(slot) = usize::try_from(handle.saturating_sub(1))
+    let freed = usize::try_from(handle.saturating_sub(1))
         .ok()
         .filter(|_| handle > 0)
         .and_then(|i| vm.core.std.hash.tables.get_mut(i))
-    {
-        *slot = None;
+        .and_then(Option::take);
+    if let Some(table) = freed {
+        release(&mut vm.core, table.bytes);
     }
     Ok(())
 }
@@ -215,16 +258,26 @@ pub fn hash_add<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
         0 => table.default_ty,
         t => t,
     };
-    if flags & HASH_ADD == 0 || flags & HASH_REPLACE != 0 {
-        let newest = table.matches(&key).next();
-        if let Some(at) = newest {
-            table.remove(at);
-        }
-    }
+    let replaced = if flags & HASH_ADD == 0 || flags & HASH_REPLACE != 0 {
+        table.matches(&key).next()
+    } else {
+        None
+    };
+    let old = replaced.and_then(|at| table.entry(at)).map_or(0, Entry::bytes);
     let value = if ty == EV_STRING { Value::Text(text) } else { Value::Words(words) };
+    let new = entry_bytes(&key, &value);
+    if !recharge(&mut vm.core, old, new) {
+        vm.warn("hash_add: out of memory for hash tables and string buffers");
+        return Ok(());
+    }
+    let Some(table) = vm.core.std.hash.get_mut(handle) else { return Ok(()) };
+    if let Some(at) = replaced {
+        table.remove(at);
+    }
     let b = table.bucket_of(&key);
     if let Some(bucket) = table.buckets.get_mut(b) {
         bucket.push(Entry { key, ty, value });
+        table.bytes = table.bytes.saturating_add(new);
     }
     Ok(())
 }
@@ -268,7 +321,10 @@ pub fn hash_delete<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError
         t.remove(at)
     });
     match removed {
-        Some(e) => ret_value(vm, &e.value),
+        Some(e) => {
+            release(&mut vm.core, e.bytes());
+            ret_value(vm, &e.value)
+        }
         None => Ok(()),
     }
 }

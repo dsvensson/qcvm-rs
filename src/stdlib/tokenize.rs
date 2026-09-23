@@ -4,11 +4,13 @@
 //!
 //! Each tokenizer replaces the VM's token list (FTE keeps one per process; qcvm one per VM).
 //! Tokens remember the byte offsets they came from, for `argv_start_index`/`argv_end_index`.
+//! The list is charged against [`crate::Limits::container_bytes`]: a string that would need more
+//! is tokenized up to the budget, with a warning.
 
 use crate::builtins::Builtins;
 use crate::error::VmError;
 use crate::host::Host;
-use crate::stdlib::util::arg_int;
+use crate::stdlib::util::{arg_int, charge, release};
 use crate::value::StrRef;
 use crate::vm::Vm;
 
@@ -35,6 +37,45 @@ pub(crate) struct Token {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Tokens {
     pub(crate) list: Vec<Token>,
+    /// Storage charged for the list.
+    bytes: usize,
+}
+
+const TOKEN_BYTES: usize = size_of::<Token>();
+
+/// The storage a finished (shrunk) token list holds.
+fn list_bytes(list: &[Token]) -> usize {
+    list.iter()
+        .fold(list.len().saturating_mul(TOKEN_BYTES), |n, t| n.saturating_add(t.text.capacity()))
+}
+
+/// How much storage a token list being built may still take.
+pub(crate) struct Budget {
+    left: usize,
+    /// A token did not fit: the list is incomplete.
+    pub(crate) exceeded: bool,
+}
+
+impl Budget {
+    pub(crate) fn new(bytes: usize) -> Self {
+        Self { left: bytes, exceeded: false }
+    }
+
+    /// Takes the storage a token with this text costs (counting the list's growth slack), or
+    /// returns `false` once the budget is spent.
+    fn take(&mut self, text: &[u8]) -> bool {
+        let cost = TOKEN_BYTES.saturating_mul(2).saturating_add(text.len());
+        match self.left.checked_sub(cost) {
+            Some(left) if !self.exceeded => {
+                self.left = left;
+                true
+            }
+            _ => {
+                self.exceeded = true;
+                false
+            }
+        }
+    }
 }
 
 impl Tokens {
@@ -178,8 +219,9 @@ fn parse_token(s: &[u8], mut p: usize, qc: bool) -> Option<(Vec<u8>, usize)> {
     }
 }
 
-/// Splits `s` like FTE's `tokenize` (`qc`) or `tokenize_console`.
-pub(crate) fn split(s: &[u8], qc: bool) -> Vec<Token> {
+/// Splits `s` like FTE's `tokenize` (`qc`) or `tokenize_console`, stopping when `budget` runs
+/// out.
+pub(crate) fn split(s: &[u8], qc: bool, budget: &mut Budget) -> Vec<Token> {
     let mut list = Vec::new();
     let mut p = 0usize;
     loop {
@@ -190,6 +232,9 @@ pub(crate) fn split(s: &[u8], qc: bool) -> Vec<Token> {
             break;
         }
         let Some((text, end)) = parse_token(s, p, qc) else { break };
+        if !budget.take(&text) {
+            break;
+        }
         list.push(Token { text, start: p, end });
         p = end;
     }
@@ -197,8 +242,9 @@ pub(crate) fn split(s: &[u8], qc: bool) -> Vec<Token> {
 }
 
 /// Splits `s` at any of `seps` (tried in order at each byte; empty separators are ignored).
-/// An empty string has no tokens; otherwise the end of the string ends the last token.
-pub(crate) fn split_by(s: &[u8], seps: &[&[u8]]) -> Vec<Token> {
+/// An empty string has no tokens; otherwise the end of the string ends the last token. Stops
+/// when `budget` runs out.
+pub(crate) fn split_by(s: &[u8], seps: &[&[u8]], budget: &mut Budget) -> Vec<Token> {
     let mut list = Vec::new();
     if s.is_empty() {
         return list;
@@ -213,20 +259,50 @@ pub(crate) fn split_by(s: &[u8], seps: &[&[u8]]) -> Vec<Token> {
         let rest = s.get(p..).unwrap_or_default();
         match seps.iter().find(|sep| !sep.is_empty() && rest.starts_with(sep)) {
             Some(sep) => {
-                list.push(token(start, p));
+                let t = token(start, p);
+                if !budget.take(&t.text) {
+                    return list;
+                }
+                list.push(t);
                 p = p.saturating_add(sep.len());
                 start = p;
             }
             None => p = p.saturating_add(1),
         }
     }
-    list.push(token(start, s.len()));
+    let t = token(start, s.len());
+    if budget.take(&t.text) {
+        list.push(t);
+    }
     list
 }
 
-fn set_tokens<H: Host>(vm: &mut Vm<H>, list: Vec<Token>) {
+/// The storage a new token list may take: what is left of the budget once the current list is
+/// dropped.
+fn budget<H: Host>(vm: &Vm<H>) -> Budget {
+    let others = vm.core.std.container_bytes.saturating_sub(vm.core.std.tokens.bytes);
+    Budget::new(vm.core.config.limits.container_bytes.saturating_sub(others))
+}
+
+/// Replaces the token list (returning its length); warns if the budget cut it short.
+fn set_tokens<H: Host>(vm: &mut Vm<H>, mut list: Vec<Token>, budget: &Budget) {
+    list.shrink_to_fit();
+    for t in &mut list {
+        t.text.shrink_to_fit();
+    }
+    let old = std::mem::take(&mut vm.core.std.tokens);
+    release(&mut vm.core, old.bytes);
+    drop(old);
+    let bytes = list_bytes(&list);
+    // The budget left room for this list, so the charge succeeds.
+    if !charge(&mut vm.core, bytes) {
+        list.clear();
+    }
     let n = list.len();
-    vm.core.std.tokens.list = list;
+    vm.core.std.tokens = Tokens { list, bytes: if n == 0 { 0 } else { bytes } };
+    if budget.exceeded {
+        vm.warn("tokenize: out of memory for the token list; the rest of the string is ignored");
+    }
     vm.ret_f32(n as f32);
 }
 
@@ -237,8 +313,9 @@ fn set_tokens<H: Host>(vm: &mut Vm<H>, list: Vec<Token>) {
 /// # Errors
 /// Never.
 pub fn tokenize<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
-    let list = split(vm.arg_str(0), true);
-    set_tokens(vm, list);
+    let mut budget = budget(vm);
+    let list = split(vm.arg_str(0), true, &mut budget);
+    set_tokens(vm, list, &budget);
     Ok(())
 }
 
@@ -248,8 +325,9 @@ pub fn tokenize<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
 /// # Errors
 /// Never.
 pub fn tokenize_console<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
-    let list = split(vm.arg_str(0), false);
-    set_tokens(vm, list);
+    let mut budget = budget(vm);
+    let list = split(vm.arg_str(0), false, &mut budget);
+    set_tokens(vm, list, &budget);
     Ok(())
 }
 
@@ -260,8 +338,9 @@ pub fn tokenize_console<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), Vm
 /// Never.
 pub fn tokenizebyseparator<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
     let seps: Vec<&[u8]> = (1..vm.argc().min(8)).map(|i| vm.arg_str(i)).collect();
-    let list = split_by(vm.arg_str(0), &seps);
-    set_tokens(vm, list);
+    let mut budget = budget(vm);
+    let list = split_by(vm.arg_str(0), &seps, &mut budget);
+    set_tokens(vm, list, &budget);
     Ok(())
 }
 
@@ -322,6 +401,14 @@ mod tests {
         list.iter().map(|t| t.text.as_slice()).collect()
     }
 
+    fn split(s: &[u8], qc: bool) -> Vec<Token> {
+        super::split(s, qc, &mut Budget::new(usize::MAX))
+    }
+
+    fn split_by(s: &[u8], seps: &[&[u8]]) -> Vec<Token> {
+        super::split_by(s, seps, &mut Budget::new(usize::MAX))
+    }
+
     #[test]
     fn qc_mode() {
         assert_eq!(texts(&split(b"say hello world", true)), [&b"say"[..], b"hello", b"world"]);
@@ -347,5 +434,16 @@ mod tests {
         assert_eq!(texts(&split_by(b"a,b,,c", &[b","])), [&b"a"[..], b"b", b"", b"c"]);
         assert_eq!(texts(&split_by(b"a::b", &[b":", b"::"])), [&b"a"[..], b"", b"b"]);
         assert_eq!(texts(&split_by(b"ab", &[b""])), [&b"ab"[..]]);
+    }
+
+    #[test]
+    fn budget_stops_tokenizing() {
+        let commas = vec![b','; 1000];
+        let mut budget = Budget::new(TOKEN_BYTES * 2 * 10);
+        assert_eq!(super::split_by(&commas, &[b","], &mut budget).len(), 10);
+        assert!(budget.exceeded);
+        let mut budget = Budget::new(TOKEN_BYTES * 2 * 3 + 3);
+        assert_eq!(texts(&super::split(b"a b c d", true, &mut budget)), [&b"a"[..], b"b", b"c"]);
+        assert!(budget.exceeded);
     }
 }

@@ -30,12 +30,17 @@ pub struct Limits {
     pub progs: u32,
     /// Maximum number of sleeping QuakeC threads.
     pub threads: u32,
+    /// Memory held by suspended threads (their captured stacks and locals), in bytes.
+    pub thread_bytes: usize,
     /// Maximum number of string buffers.
     pub string_buffers: u32,
     /// Maximum number of entries in one string buffer.
     pub string_buffer_entries: u32,
     /// Maximum number of hash tables.
     pub hash_tables: u32,
+    /// Memory for the contents of hash tables, string buffers and the token list (buckets,
+    /// entries, keys, copied strings and tokens), in bytes. Adds beyond it fail with a warning.
+    pub container_bytes: usize,
     /// Warnings reported per top-level call before further ones are only counted.
     pub warnings_per_call: u32,
 }
@@ -54,9 +59,11 @@ impl Default for Limits {
             progs_area_bytes: 16 << 20,
             progs: 16,
             threads: 1024,
+            thread_bytes: 16 << 20,
             string_buffers: 1024,
             string_buffer_entries: 1 << 20,
             hash_tables: 1024,
+            container_bytes: 64 << 20,
             warnings_per_call: 64,
         }
     }

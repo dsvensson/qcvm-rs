@@ -38,6 +38,8 @@ pub(crate) struct StdState {
     pub(crate) tokens: tokenize::Tokens,
     pub(crate) hash: hash::Tables,
     pub(crate) bufs: strbuf::Buffers,
+    /// Bytes charged against [`crate::Limits::container_bytes`] by hash tables and buffers.
+    pub(crate) container_bytes: usize,
 }
 
 /// Registers every standard builtin.

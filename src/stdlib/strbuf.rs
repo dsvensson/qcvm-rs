@@ -8,12 +8,12 @@
 //! so they outlive the temp strings they came from.
 
 use crate::builtins::Builtins;
-use crate::error::VmError;
+use crate::error::{ErrorKind, Resource, VmError};
 use crate::host::Host;
 use crate::vm::Vm;
 use crate::vm::num::f2i;
 
-use super::util::{arg_int, opt_f32};
+use super::util::{arg_int, opt_f32, recharge, release};
 
 /// Registers this module's builtins.
 pub(crate) fn register<H: Host>(b: &mut Builtins<H>) {
@@ -35,16 +35,39 @@ pub(crate) fn register<H: Host>(b: &mut Builtins<H>) {
 /// FTE refuses `bufstr_set` indices above this.
 const MAX_SET_INDEX: usize = 1 << 20;
 
+/// Storage charged per entry slot (see [`crate::Limits::container_bytes`]).
+const SLOT_BYTES: usize = size_of::<Option<Box<[u8]>>>();
+
 /// One string buffer.
 #[derive(Clone, Debug, Default)]
 struct StrBuf {
     /// The entries; the length is the buffer's size.
     strings: Vec<Option<Box<[u8]>>>,
+    /// Storage the buffer holds: its slots and strings.
+    bytes: usize,
 }
 
 impl StrBuf {
-    /// Stores `s` at `i`, growing the buffer.
+    fn from_strings(strings: Vec<Option<Box<[u8]>>>) -> Self {
+        let bytes = strings.iter().fold(strings.len().saturating_mul(SLOT_BYTES), |n, s| {
+            n.saturating_add(s.as_ref().map_or(0, |s| s.len()))
+        });
+        Self { strings, bytes }
+    }
+
+    /// The storage the buffer would hold after `set(i, s)` with `s.len() == len`.
+    fn bytes_after_set(&self, i: usize, len: usize) -> usize {
+        let grow = i.saturating_add(1).saturating_sub(self.strings.len());
+        let old = self.strings.get(i).and_then(Option::as_ref).map_or(0, |s| s.len());
+        self.bytes
+            .saturating_add(grow.saturating_mul(SLOT_BYTES))
+            .saturating_add(len)
+            .saturating_sub(old)
+    }
+
+    /// Stores `s` at `i`, growing the buffer. The storage must have been charged.
     fn set(&mut self, i: usize, s: &[u8]) {
+        self.bytes = self.bytes_after_set(i, s.len());
         if i >= self.strings.len() {
             self.strings.resize(i.saturating_add(1), None);
         }
@@ -52,6 +75,42 @@ impl StrBuf {
             *slot = Some(s.into());
         }
     }
+
+    /// Turns entry `i` into a hole; returns the bytes freed.
+    fn free(&mut self, i: usize) -> usize {
+        let freed = self.strings.get_mut(i).and_then(Option::take).map_or(0, |s| s.len());
+        self.bytes = self.bytes.saturating_sub(freed);
+        freed
+    }
+}
+
+/// Charges for and performs `set(i, s)` on buffer `b`. Returns `false` (with a warning) if the
+/// memory limit does not allow it.
+fn store<H: Host>(vm: &mut Vm<H>, b: usize, i: usize, s: &[u8]) -> bool {
+    let Some(buf) = vm.core.std.bufs.get(b) else { return false };
+    let (old, new) = (buf.bytes, buf.bytes_after_set(i, s.len()));
+    if !recharge(&mut vm.core, old, new) {
+        vm.warn("string buffers: out of memory for hash tables and string buffers");
+        return false;
+    }
+    if let Some(buf) = vm.core.std.bufs.get_mut(b) {
+        buf.set(i, s);
+    }
+    true
+}
+
+/// Replaces the contents of buffer `b`, charging the difference. Returns `false` (with a
+/// warning, changing nothing) if the memory limit does not allow it.
+fn replace<H: Host>(vm: &mut Vm<H>, b: usize, contents: StrBuf) -> bool {
+    let Some(old) = vm.core.std.bufs.get(b).map(|buf| buf.bytes) else { return false };
+    if !recharge(&mut vm.core, old, contents.bytes) {
+        vm.warn("string buffers: out of memory for hash tables and string buffers");
+        return false;
+    }
+    if let Some(buf) = vm.core.std.bufs.get_mut(b) {
+        *buf = contents;
+    }
+    true
 }
 
 /// The VM's string buffers.
@@ -118,9 +177,9 @@ pub fn buf_create<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError>
 /// `void buf_del(strbuf buf)`: deletes a buffer.
 pub fn buf_del<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
     if let Some(i) = buf_arg(vm, 0)
-        && let Some(slot) = vm.core.std.bufs.bufs.get_mut(i)
+        && let Some(buf) = vm.core.std.bufs.bufs.get_mut(i).and_then(Option::take)
     {
-        *slot = None;
+        release(&mut vm.core, buf.bytes);
     }
     Ok(())
 }
@@ -139,9 +198,8 @@ pub fn buf_copy<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
     if from == to {
         return Ok(());
     }
-    let copy = vm.core.std.bufs.get(from).cloned();
-    if let (Some(copy), Some(dst)) = (copy, vm.core.std.bufs.get_mut(to)) {
-        *dst = copy;
+    if let Some(copy) = vm.core.std.bufs.get(from).cloned() {
+        replace(vm, to, copy);
     }
     Ok(())
 }
@@ -161,7 +219,8 @@ pub fn buf_sort<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
         let ord = prefix_of(a, prefix).cmp(prefix_of(b, prefix));
         if backward { ord.reverse() } else { ord }
     });
-    buf.strings = strings.into_iter().map(Some).collect();
+    // Dropping the holes only shrinks the buffer, so this cannot fail.
+    replace(vm, i, StrBuf::from_strings(strings.into_iter().map(Some).collect()));
     Ok(())
 }
 
@@ -178,10 +237,21 @@ pub fn buf_implode<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError
         return Ok(());
     };
     let glue = vm.arg_str(1).to_vec();
-    let mut out = Vec::new();
-    for s in
-        vm.core.std.bufs.get(i).map(|b| b.strings.as_slice()).unwrap_or_default().iter().flatten()
-    {
+    let strings = vm.core.std.bufs.get(i).map(|b| b.strings.as_slice()).unwrap_or_default();
+    // Size the result first (the glue repeats per entry), refusing it before building it if the
+    // temp strings have no room for it.
+    let mut total = 0usize;
+    for s in strings.iter().flatten() {
+        if total > 0 {
+            total = total.saturating_add(glue.len());
+        }
+        total = total.saturating_add(s.len());
+        if !vm.core.strings.fits(total) {
+            return Err(ErrorKind::OutOfMemory(Resource::TempStrings).into());
+        }
+    }
+    let mut out = Vec::with_capacity(total);
+    for s in strings.iter().flatten() {
         if !out.is_empty() {
             out.extend_from_slice(&glue);
         }
@@ -215,9 +285,7 @@ pub fn bufstr_set<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError>
         return Ok(());
     }
     let s = vm.arg_str(2).to_vec();
-    if let Some(buf) = vm.core.std.bufs.get_mut(b) {
-        buf.set(i, &s);
-    }
+    store(vm, b, i, &s);
     Ok(())
 }
 
@@ -232,7 +300,7 @@ pub fn bufstr_add<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError>
     let s = vm.arg_str(1).to_vec();
     let ordered = arg_int(vm, 2) != 0;
     let limit = entry_limit(vm);
-    let Some(buf) = vm.core.std.bufs.get_mut(b) else { return Ok(()) };
+    let Some(buf) = vm.core.std.bufs.get(b) else { return Ok(()) };
     let len = buf.strings.len();
     let i = if ordered { len } else { buf.strings.iter().position(Option::is_none).unwrap_or(len) };
     if i >= limit {
@@ -240,7 +308,10 @@ pub fn bufstr_add<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError>
         vm.ret_f32(-1.0);
         return Ok(());
     }
-    buf.set(i, &s);
+    if !store(vm, b, i, &s) {
+        vm.ret_f32(-1.0);
+        return Ok(());
+    }
     vm.ret_f32(i as f32);
     Ok(())
 }
@@ -249,8 +320,8 @@ pub fn bufstr_add<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError>
 /// change).
 pub fn bufstr_free<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
     let (Some(b), Some(i)) = (buf_arg(vm, 0), index_arg(vm, 1)) else { return Ok(()) };
-    if let Some(slot) = vm.core.std.bufs.get_mut(b).and_then(|buf| buf.strings.get_mut(i)) {
-        *slot = None;
+    if let Some(freed) = vm.core.std.bufs.get_mut(b).map(|buf| buf.free(i)) {
+        release(&mut vm.core, freed);
     }
     Ok(())
 }
@@ -331,9 +402,7 @@ pub fn buf_cvarlist<H: Host>(vm: &mut Vm<H>, host: &mut H) -> Result<(), VmError
     let mut names = host.cvar_list(vm.arg_str(1), vm.arg_str(2));
     names.sort();
     names.truncate(entry_limit(vm));
-    if let Some(buf) = vm.core.std.bufs.get_mut(b) {
-        buf.strings = names.into_iter().map(|n| Some(n.into_boxed_slice())).collect();
-    }
+    replace(vm, b, StrBuf::from_strings(names.into_iter().map(|n| Some(n.into())).collect()));
     Ok(())
 }
 
@@ -364,13 +433,10 @@ pub fn buf_loadfile<H: Host>(vm: &mut Vm<H>, host: &mut H) -> Result<(), VmError
     let Some(b) = buf_arg(vm, 1) else { return Ok(()) };
     let Some(data) = host.read_file(vm.arg_str(0)) else { return Ok(()) };
     let limit = entry_limit(vm);
-    if let Some(buf) = vm.core.std.bufs.get_mut(b) {
-        for line in file_lines(&data) {
-            let i = buf.strings.len();
-            if i >= limit {
-                break;
-            }
-            buf.set(i, line);
+    for line in file_lines(&data) {
+        let i = vm.core.std.bufs.get(b).map_or(usize::MAX, |buf| buf.strings.len());
+        if i >= limit || !store(vm, b, i, line) {
+            break;
         }
     }
     vm.ret_f32(1.0);

@@ -230,3 +230,36 @@ fn getcb_calls_back_for_every_entry() {
     let r = StrRef(value[0].to_bits());
     assert_eq!(h.vm.str(r), b"text");
 }
+
+/// Filling a bucket and deleting everything in it frees its storage as well as the budget it
+/// was charged: churn cannot accumulate storage the budget no longer counts, and every round
+/// fits as many entries as the first.
+#[test]
+fn deleted_entries_give_back_their_storage() {
+    let limits = qcvm::Limits { container_bytes: 16 * 1024, ..qcvm::Limits::default() };
+    let config = VmConfig { limits, ..VmConfig::default() };
+    let mut h = Harness::with(Numbering::Csqc, config, |_| {});
+    let t = h.f("hash_createtab", &[f(4.0), f(1.0)]);
+    // HASH_ADD (512) with EV_STRING: every entry lands in the same bucket under one key.
+    let fill = |h: &mut Harness| {
+        let mut n = 0usize;
+        loop {
+            h.call("hash_add", &[f(t), s("k"), s("v"), f(513.0)]).unwrap();
+            let nth = [f(t), s("k"), f(0.0), f(0.0), f(n as f32)];
+            if h.call("hash_get", &nth).unwrap().0[0] == 0 {
+                return n;
+            }
+            n += 1;
+            assert!(n < 100_000);
+        }
+    };
+    let first = fill(&mut h);
+    assert!(first > 20, "{first}");
+    for _ in 0..4 {
+        for _ in 0..first {
+            h.call("hash_delete", &[f(t), s("k")]).unwrap();
+        }
+        assert_eq!(h.call("hash_get", &[f(t), s("k")]).unwrap().0[0], 0);
+        assert_eq!(fill(&mut h), first);
+    }
+}

@@ -134,6 +134,14 @@ impl<H: Host> Vm<H> {
         let wake = self.qc_time() + delay;
         match snapshot(&self.core, wake, resume) {
             Some(thread) => {
+                let held = self
+                    .core
+                    .threads
+                    .iter()
+                    .fold(thread.data.len(), |n, t| n.saturating_add(t.data.len()));
+                if held > self.core.config.limits.thread_bytes {
+                    return Err(ErrorKind::OutOfMemory(Resource::Threads).into());
+                }
                 self.core.threads.push(thread);
                 Ok(true)
             }

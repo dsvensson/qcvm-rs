@@ -125,8 +125,11 @@ notification. Every method has a default, so a host implements only what it supp
 
 `Limits` bounds everything QuakeC controls: entities, heap, temp strings (count and bytes),
 local stack, call depth, re-entrancy, instructions per host call (the runaway counter), progs,
-threads, string buffers and hash tables, warnings per call. Exceeding one is an error, never an
-abort or an unbounded allocation.
+threads (count and snapshot memory), string buffers and hash tables (count, entries, and one
+shared memory budget for their contents and the token list), JSON trees (by the heap), warnings
+per call. Exceeding one is an error or a refused operation with a warning, never an abort or an
+unbounded allocation. Builtins whose work grows with their input (searching every entity, say)
+are bounded by those limits but not counted by the runaway counter, as in FTE.
 
 ## Testing
 

@@ -243,3 +243,18 @@ fn null_and_bad_nodes() {
     assert_eq!(ty(&mut h, 0x7FFF_FFF0), NULL);
     assert_eq!(warnings(&h).len(), 1);
 }
+
+/// A document whose tree cannot fit the heap is refused after a pass that allocates nothing,
+/// however wide it is; documents that fit still parse.
+#[test]
+fn documents_too_large_for_the_heap_are_refused_up_front() {
+    let limits = qcvm::Limits { heap_bytes: 64 * 1024, ..qcvm::Limits::default() };
+    let config = VmConfig { limits, developer: true, ..VmConfig::default() };
+    let mut h = Harness::with(Numbering::Csqc, config, Harness::named(&["json_parse"]));
+    let wide = format!("[{}]", "0,".repeat(200_000));
+    let started = std::time::Instant::now();
+    assert_eq!(parse(&mut h, &wide), 0);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(!warnings(&h).is_empty(), "developer mode reports the builtin error as a warning");
+    assert_ne!(parse(&mut h, "[1, 2, {\"a\": \"b\"}]"), 0);
+}

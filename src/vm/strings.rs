@@ -97,8 +97,21 @@ impl Strings {
         self.live
     }
 
+    /// Bytes of temp-string storage still available.
+    pub(crate) fn room(&self) -> usize {
+        self.max_bytes.saturating_sub(self.bytes)
+    }
+
+    /// Whether a temp string of `len` bytes (without terminator) would fit.
+    pub(crate) fn fits(&self, len: usize) -> bool {
+        len.checked_add(4).is_some_and(|n| n & !3 <= self.room())
+    }
+
     /// Stores `text` (without terminator) as a new temp string.
     pub(crate) fn alloc(&mut self, text: &[u8]) -> Result<u32, Resource> {
+        if !self.fits(text.len()) {
+            return Err(Resource::TempStrings);
+        }
         let mut data = Vec::new();
         let padded = text.len().checked_add(4).map(|n| n & !3).ok_or(Resource::TempStrings)?;
         data.try_reserve_exact(padded).map_err(|_| Resource::TempStrings)?;

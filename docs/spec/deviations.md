@@ -69,6 +69,8 @@ production code should leave them off.
 | `json_parse` | decodes `\uXXXX` from its own output buffer; unbounded nesting | decodes from the input (low surrogates up to `DFFF`); at most 256 levels |
 | `buf_loadfile` | splits lines longer than 8191 bytes | keeps lines whole |
 | `bufstr_set`/`bufstr_add` beyond `Limits::string_buffer_entries` | accepts index 1,048,576 | refuses it with a warning (−1 from `bufstr_add`) |
+| Hash tables, string buffers and token lists beyond `Limits::container_bytes` (64 MiB) | unbounded | `hash_createtab` returns 0, `hash_add` and `bufstr_set` do nothing, `bufstr_add` returns −1, the tokenizers stop at the budget, each with a warning |
+| `sleep`/`fork` beyond `Limits::thread_bytes` (16 MiB of snapshots) | unbounded | an out-of-memory error |
 | `externcall` | passes on at most five argument slots | passes every remaining argument |
 | `findradius_list` | measures a different distance than `findradius` | the same test as `findradius` (distance to the box centre) |
 | `error` in developer mode | a warning | always fatal (`ErrorKind::QcError`) |

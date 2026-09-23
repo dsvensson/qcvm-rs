@@ -10,7 +10,7 @@
 use std::cmp::Ordering;
 
 use crate::builtins::Builtins;
-use crate::error::VmError;
+use crate::error::{ErrorKind, Resource, VmError};
 use crate::host::Host;
 use crate::stdlib::charset::{self, REPLACEMENT};
 use crate::stdlib::format::quote_string;
@@ -104,7 +104,12 @@ pub fn memstrsize<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError>
 /// # Errors
 /// Only if the result string cannot be allocated.
 pub fn strcat<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
-    let mut out = Vec::new();
+    // Refuse before building a result the temp strings have no room for.
+    let total = (0..vm.argc().min(8)).fold(0usize, |n, i| n.saturating_add(vm.arg_str(i).len()));
+    if !vm.core.strings.fits(total) {
+        return Err(ErrorKind::OutOfMemory(Resource::TempStrings).into());
+    }
+    let mut out = Vec::with_capacity(total);
     for i in 0..vm.argc().min(8) {
         out.extend_from_slice(vm.arg_str(i));
     }
