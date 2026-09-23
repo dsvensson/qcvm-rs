@@ -17,7 +17,9 @@ mod support;
 
 mod builtins_misc;
 mod builtins_strings;
+mod csprogs;
 mod differential;
+mod fuzz;
 mod license;
 mod loader;
 mod multiprogs;

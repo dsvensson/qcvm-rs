@@ -106,6 +106,17 @@ pub enum VmKind {
     Menu,
 }
 
+/// A field given a non-zero value whenever an entity is spawned.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpawnDefault {
+    /// The float field to set.
+    pub field: String,
+    /// A float global supplying the value, if the progs defines it.
+    pub global: Option<String>,
+    /// The value used when the progs does not define `global`.
+    pub value: f32,
+}
+
 /// VM configuration.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VmConfig {
@@ -123,6 +134,8 @@ pub struct VmConfig {
     pub state_step: f32,
     /// Fields zeroed when an entity is removed (the rest stay readable until reuse).
     pub remove_clears: Vec<String>,
+    /// Fields set on every spawned entity (and the world) after its fields are zeroed.
+    pub spawn_defaults: Vec<SpawnDefault>,
     /// Entity slots below this are never handed out by spawn (SSQC reserves the clients).
     pub first_spawnable: u32,
     /// Extra bytes reserved per entity for fields added later (`ensure_field`, `addprogs`).
@@ -150,6 +163,7 @@ impl VmConfig {
             seed: 0x5EED_0FC5_C0DE,
             state_step: 0.1,
             remove_clears: clears.iter().map(|s| (*s).to_owned()).collect(),
+            spawn_defaults: Vec::new(),
             first_spawnable: 0,
             field_reserve_bytes: 256,
             shared_globals: ["self", "other", "time", "frametime"].map(String::from).to_vec(),
@@ -157,10 +171,11 @@ impl VmConfig {
         }
     }
 
-    /// Defaults for client-side QuakeC, as FTE's CSQC.
+    /// Defaults for client-side QuakeC, as FTE's CSQC: spawned entities collide with every
+    /// dimension (`dimension_solid`/`dimension_hit` take the `dimension_default` global, or 255).
     #[must_use]
     pub fn csqc() -> Self {
-        Self::base(
+        let mut config = Self::base(
             VmKind::Csqc,
             &[
                 "solid",
@@ -172,7 +187,15 @@ impl VmConfig {
                 "drawmask",
                 "renderflags",
             ],
-        )
+        );
+        config.spawn_defaults = ["dimension_solid", "dimension_hit"]
+            .map(|field| SpawnDefault {
+                field: field.to_owned(),
+                global: Some("dimension_default".to_owned()),
+                value: 255.0,
+            })
+            .to_vec();
+        config
     }
 
     /// Defaults for server-side QuakeC.

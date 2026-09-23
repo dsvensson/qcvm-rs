@@ -184,8 +184,7 @@ fn huge_field_counts_are_refused_quickly() {
 
 #[test]
 fn field_reserve_is_enforced() {
-    let mut config = VmConfig::default();
-    config.field_reserve_bytes = 16;
+    let config = VmConfig { field_reserve_bytes: 16, ..VmConfig::default() };
     let mut vm: Vm<TestHost> =
         Vm::new(load(&main_progs()), Arc::new(Builtins::empty(Numbering::None)), config).unwrap();
     let mut greedy = Asm::new();

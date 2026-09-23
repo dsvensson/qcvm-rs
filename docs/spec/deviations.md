@@ -19,8 +19,8 @@ production code should leave them off.
 | `NE_S` result | stores the raw `strcmp` result as a float (may be negative or >1) | stores `1.0`/`0.0` | `ne_s_raw_strcmp` |
 | `LOAD_I64` on an invalid entity | zeroes three result words (one too many) | zeroes the two result words | `load_i64_zero3` |
 | `SWITCH`/`CASE` state | kept in interpreter locals, reset to (float, global 0) after every call/return | kept per call frame | `switch_reset_on_call` |
-| Function index bound | accepts `index == numfunctions` (off by one) | rejects `index >= numfunctions` | `function_index_off_by_one` |
-| Pointer bound check | `p + n < used`, 32-bit arithmetic (wraps) | `p + n <= end` computed in 64 bits | `pointer_bound_strict` |
+| Function index bound | accepts `index == numfunctions` (off by one) | rejects `index >= numfunctions` | — |
+| Pointer bound check | `p + n < used`, 32-bit arithmetic (wraps) | `p + n <= end` of the region, without wrapping | — |
 | `LOADP_ITOF`/`LOADP_FTOI` | checks 1 byte, reads 4 | checks 4 bytes | — |
 | 12-byte temp-string fallback read | faults | zero-fills like smaller reads | — |
 | Operand sanitizer | treats `SWITCH_*.b` as a global operand (large switches get poisoned) | `SWITCH_*.b` is a jump offset | — |

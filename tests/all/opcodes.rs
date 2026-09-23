@@ -586,7 +586,7 @@ fn hexen2_arrays(t: &mut Tester) {
         (Op::FetchGblFnc, 1),
         (Op::FetchGblV, 3),
     ] {
-        let mut run = |t: &mut Tester, index: f32| {
+        let run = |t: &mut Tester, index: f32| {
             t.covered.insert(op as u16);
             let mut asm = Asm::new();
             // Prefix word holds count - 1 (3 elements).

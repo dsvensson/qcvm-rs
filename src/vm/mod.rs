@@ -16,12 +16,12 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
-pub use config::{CharScheme, Charset, FteCompat, Limits, VmConfig, VmKind};
+pub use config::{CharScheme, Charset, FteCompat, Limits, SpawnDefault, VmConfig, VmKind};
 pub use interp::StateOp;
 pub use strings::GcStats;
 
 use self::core::{
-    Callee, Core, Exec, FieldTable, NO_FUNCTION, OFS_PARM0, OFS_RETURN, ProgsState, Rng,
+    Callee, Core, Exec, FieldTable, NO_FUNCTION, OFS_PARM0, OFS_RETURN, ProgsState, Rng, SpawnFill,
 };
 use self::interp::Exit;
 use self::memory::Memory;
@@ -674,7 +674,9 @@ impl<H: Host> Vm<H> {
     pub fn spawn(&mut self) -> Result<EntRef, VmError> {
         let now = self.realtime();
         let first = self.core.config.first_spawnable;
-        self.core.mem.spawn(now, first).map(EntRef).map_err(VmError::from)
+        let e = self.core.mem.spawn(now, first).map_err(VmError::from)?;
+        self.core.apply_spawn_defaults(e);
+        Ok(EntRef(e))
     }
 
     /// Frees an entity. `instant` makes its slot reusable immediately.
@@ -1082,6 +1084,16 @@ fn build_core<H: Host>(
     let field_ofs = |name: &str| fields.get(name.as_bytes()).map(|f| f.ofs);
     let remove_clears =
         config.remove_clears.iter().filter_map(|n| field_ofs(n)).collect::<Vec<_>>();
+    let spawn_defaults = config
+        .spawn_defaults
+        .iter()
+        .filter_map(|d| {
+            let global = d.global.as_ref().and_then(|g| program.global_def(g)).map(|def| {
+                usize_from(gbase_u32).saturating_add(usize_from(def.offset).saturating_mul(4))
+            });
+            Some(SpawnFill { field: field_ofs(&d.field)?, global, value: d.value.to_bits() })
+        })
+        .collect::<Vec<_>>();
 
     let callees = bind(&program, builtins);
     let progs = vec![ProgsState {
@@ -1109,6 +1121,7 @@ fn build_core<H: Host>(
         suppressed: 0,
         trace: false,
         remove_clears,
+        spawn_defaults,
         std: crate::stdlib::StdState::default(),
         abort_ret: None,
         shared: multiprogs::SharedTable::default(),
@@ -1117,5 +1130,6 @@ fn build_core<H: Host>(
         config,
     };
     multiprogs::register_shared(&mut core, 0);
+    core.apply_spawn_defaults(0);
     Ok(core)
 }

@@ -565,9 +565,13 @@ impl Program {
         self.field_defs.iter().map(|d| self.def_info(d))
     }
 
-    /// The name of the first global defined at word `offset`, if any.
+    /// The name of the first global defined at word `offset`, if any. Word 0, the null global,
+    /// has no name (fteqcc parks the definitions of stripped constants there).
     #[must_use]
     pub fn global_name_at(&self, offset: u32) -> Option<&[u8]> {
+        if offset == 0 {
+            return None;
+        }
         let def = self.global_defs.get(usize_from(*self.global_name_by_ofs.get(&offset)?))?;
         Some(self.string_at(def.name))
     }

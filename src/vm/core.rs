@@ -177,6 +177,14 @@ impl Rng {
     }
 }
 
+/// A field filled in on spawn: from a float global (absolute S offset) if present, else `value`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SpawnFill {
+    pub(crate) field: u32,
+    pub(crate) global: Option<usize>,
+    pub(crate) value: u32,
+}
+
 /// Everything the interpreter touches; independent of the host type.
 #[derive(Clone, Debug)]
 pub(crate) struct Core {
@@ -199,6 +207,8 @@ pub(crate) struct Core {
     pub(crate) trace: bool,
     /// Field words zeroed by `remove`.
     pub(crate) remove_clears: Vec<u32>,
+    /// Resolved [`crate::vm::SpawnDefault`]s.
+    pub(crate) spawn_defaults: Vec<SpawnFill>,
     /// State of the standard builtins (tokens, hash tables, string buffers).
     pub(crate) std: crate::stdlib::StdState,
     /// The value `abort(ret)` returns from the engine boundary it unwound to.
@@ -212,6 +222,19 @@ pub(crate) struct Core {
 }
 
 impl Core {
+    /// Applies the configured spawn defaults to a freshly zeroed entity.
+    pub(crate) fn apply_spawn_defaults(&mut self, e: u32) {
+        for i in 0..self.spawn_defaults.len() {
+            let Some(&SpawnFill { field, global, value }) = self.spawn_defaults.get(i) else {
+                break;
+            };
+            let v = global.map_or(value, |at| self.mem.g(at));
+            if let Some(at) = self.mem.field_offset(e, field, 1) {
+                self.mem.set_ent_word(at, v);
+            }
+        }
+    }
+
     /// Records a warning with the current backtrace (rate limited per top-level call).
     #[cold]
     pub(crate) fn warn(&mut self, kind: WarningKind) {

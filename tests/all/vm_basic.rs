@@ -620,3 +620,42 @@ fn abort_unwinds_to_the_engine_boundary() {
     // The inner function's local was restored by the unwind.
     assert_eq!(vm.call(&mut host, func(&vm, "outer"), &[]).unwrap().f32(), 42.0);
 }
+
+#[test]
+fn csqc_spawn_defaults_fill_the_dimension_fields() {
+    let mut asm = Asm::new();
+    asm.field("dimension_solid", ty::FLOAT);
+    asm.field("dimension_hit", ty::FLOAT);
+    asm.function("noop", &[], 0);
+    asm.emit(Op::Done, 0, 0, 0);
+    let mut m = vm(&asm);
+    let solid = m.field::<f32>("dimension_solid").unwrap();
+    let hit = m.field::<f32>("dimension_hit").unwrap();
+    assert_eq!(m.get_field(EntRef(0), solid), Some(255.0), "the world is spawned too");
+    let e = m.spawn().unwrap();
+    assert_eq!((m.get_field(e, solid), m.get_field(e, hit)), (Some(255.0), Some(255.0)));
+
+    // With a `dimension_default` global, its value at spawn time is used instead.
+    let mut asm = Asm::new();
+    asm.field("dimension_solid", ty::FLOAT);
+    asm.global("dimension_default", ty::FLOAT, &[7.0f32.to_bits()]);
+    let mut m = vm(&asm);
+    let solid = m.field::<f32>("dimension_solid").unwrap();
+    let g = m.global::<f32>("dimension_default").unwrap();
+    let e = m.spawn().unwrap();
+    assert_eq!(m.get_field(e, solid), Some(7.0));
+    m.set(g, 3.0);
+    let e = m.spawn().unwrap();
+    assert_eq!(m.get_field(e, solid), Some(3.0));
+
+    // Other presets leave spawned entities all zero.
+    let mut vm: Vm<TestHost> = Vm::new(
+        std::sync::Arc::new(qcvm::Program::parse(&asm.build(qcvm::ProgsFormat::Fte16)).unwrap()),
+        std::sync::Arc::new(Builtins::empty(Numbering::None)),
+        qcvm::VmConfig::ssqc(),
+    )
+    .unwrap();
+    let solid = vm.field::<f32>("dimension_solid").unwrap();
+    let e = vm.spawn().unwrap();
+    assert_eq!(vm.get_field(e, solid), Some(0.0));
+}

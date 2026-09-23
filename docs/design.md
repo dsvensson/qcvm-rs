@@ -94,8 +94,7 @@ statics       0xC000_0000|idx  — host-interned, never collected
 - `Limits` for every resource (edicts, field capacity, heap, temps, local stack, call depth 1024,
   runaway 100M, progs area/count, threads, strbufs, hash tables, warnings); `try_reserve` for any
   QC-sized allocation. `FteCompat` flags (default off; differential tests switch them on to match
-  the oracle exactly): NE_S raw strcmp, LOAD_I64 3-word zeroing, switch reset on call,
-  `== numfunctions` accepted, `<` pointer bound.
+  the oracle exactly): NE_S raw strcmp, LOAD_I64 3-word zeroing, switch reset on call.
 
 ### Multiprogs & coroutines (designed into frames/memory from M2; implemented M8/M9)
 - `FuncRef = prnum<<24 | index`; same-progs calls take a one-compare fast path; cross-progs CALL

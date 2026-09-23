@@ -13,6 +13,7 @@
 
 pub mod builtins;
 mod bytes;
+pub mod csqc;
 pub mod error;
 pub mod host;
 pub mod opcode;
