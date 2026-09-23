@@ -15,6 +15,7 @@ use std::sync::Arc;
 use crate::bytes::usize_from;
 use crate::error::{ErrorKind, WarningKind};
 use crate::opcode::Op;
+use crate::progs::Stmt;
 use crate::value::{EntRef, FuncRef, PrNum};
 use crate::vm::core::{Callee, Core, OFS_PARM0, OFS_PARM1, OFS_RETURN, SwitchKind};
 use crate::vm::memory::{EntSlot, WriteError};
@@ -81,22 +82,316 @@ pub(crate) enum Exit {
 /// that crate's optimisation level).
 #[inline(never)]
 pub(crate) fn run_fast(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit {
-    run::<false>(core, exit_depth, budget)
+    run::<false, Whole>(core, exit_depth, budget)
+}
+
+/// [`run`] without tracing, reaching operands through the [`WINDOW`]: only for a VM whose
+/// operands all lie in it ([`window_fits`]).
+#[inline(never)]
+pub(crate) fn run_window(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit {
+    run::<false, Window>(core, exit_depth, budget)
 }
 
 /// [`run`] with tracing.
 #[inline(never)]
 pub(crate) fn run_traced(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit {
-    run::<true>(core, exit_depth, budget)
+    run::<true, Whole>(core, exit_depth, budget)
+}
+
+/// `STOREF_*` of `N` bytes from global `oc` when the entity and field are valid and the entity is
+/// writable, for the interpreter's inner loop. Returns false, having done nothing, otherwise.
+#[inline(always)]
+fn store_field_view<const N: usize, T: Words + ?Sized>(
+    w: &T,
+    ents: &mut [u8],
+    map: &PointerMap<'_>,
+    oa: usize,
+    ob: usize,
+    oc: usize,
+) -> bool {
+    let (e, f) = (g(w, oa), g(w, ob));
+    let within = u64::from(f).wrapping_mul(4);
+    if within.wrapping_add(N as u64) > u64::from(map.field_bytes)
+        || map.slots.get(usize_from(e)).is_none_or(|slot| slot.protected)
+    {
+        return false;
+    }
+    let mut bytes = [0u8; N];
+    for (k, chunk) in bytes.chunks_exact_mut(4).enumerate() {
+        chunk.copy_from_slice(&g(w, oc.wrapping_add(k.wrapping_mul(4))).to_le_bytes());
+    }
+    let off = u64::from(e).wrapping_shl(map.shift).wrapping_add(within);
+    let Ok(off) = usize::try_from(off) else { return false };
+    match ents.get_mut(off..).and_then(<[u8]>::first_chunk_mut::<N>) {
+        Some(dst) => {
+            *dst = bytes;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Byte offset in region E of an `n`-byte access at pointer `p`, if it lies in a valid field of an
+/// allocated entity (what `Memory::locate` finds in region E), and whether that entity is
+/// protected.
+#[inline(always)]
+fn ent_target(map: &PointerMap<'_>, p: u32, n: u32) -> Option<(usize, bool)> {
+    let off = p.checked_sub(map.e_base)?;
+    let e = off.wrapping_shr(map.shift);
+    let within = off & 1u32.wrapping_shl(map.shift).wrapping_sub(1);
+    let slot = map.slots.get(usize_from(e))?;
+    (u64::from(within).wrapping_add(u64::from(n)) <= u64::from(map.field_bytes))
+        .then_some((usize_from(off), slot.protected))
+}
+
+/// Writes `bytes` through pointer `p` for the interpreter's inner loop, if it lands in its view
+/// of region S (not at null) or in a writable entity field. Returns false, having written
+/// nothing, otherwise.
+#[inline(always)]
+fn ptr_write_view<const N: usize, T: Words + ?Sized>(
+    w: &mut T,
+    ents: &mut [u8],
+    map: &PointerMap<'_>,
+    p: u32,
+    bytes: [u8; N],
+) -> bool {
+    if let Some(dst) = w.bytes_mut::<N>(usize_from(p)) {
+        if p == 0 {
+            return false;
+        }
+        *dst = bytes;
+        return true;
+    }
+    let Some((off, false)) = ent_target(map, p, N as u32) else { return false };
+    match ents.get_mut(off..).and_then(<[u8]>::first_chunk_mut::<N>) {
+        Some(dst) => {
+            *dst = bytes;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Reads `N` bytes through pointer `p` for the interpreter's inner loop, if it lands in its view
+/// of region S or in an entity field; `None` otherwise.
+#[inline(always)]
+fn ptr_read_view<const N: usize, T: Words + ?Sized>(
+    w: &T,
+    ents: &[u8],
+    map: &PointerMap<'_>,
+    p: u32,
+) -> Option<[u8; N]> {
+    if let Some(src) = w.bytes::<N>(usize_from(p)) {
+        return Some(*src);
+    }
+    let (off, _) = ent_target(map, p, N as u32)?;
+    ents.get(off..)?.first_chunk::<N>().copied()
+}
+
+/// `MULSTOREP_F`, `DIVSTOREP_F`, `ADDSTOREP_F`, `SUBSTOREP_F` for the interpreter's inner loop,
+/// when the pointer lands in its view of region S (not at null) or in a writable entity field:
+/// `*B op= A`, then `C` = the new value. Returns false, having done nothing, otherwise.
+#[inline(always)]
+fn compound_store_view<T: Words + ?Sized>(
+    w: &mut T,
+    ents: &mut [u8],
+    map: &PointerMap<'_>,
+    op: Op,
+    oa: usize,
+    ob: usize,
+    oc: usize,
+) -> bool {
+    let (p, a) = (g(w, ob), gf(w, oa));
+    let apply = |b: f32| match op {
+        Op::MulStorePF => b * a,
+        Op::DivStorePF => b / a,
+        Op::AddStorePF => b + a,
+        _ => b - a,
+    };
+    let v = if let Some(word) = w.bytes_mut::<4>(usize_from(p)) {
+        if p == 0 {
+            return false;
+        }
+        let v = apply(f32::from_le_bytes(*word));
+        *word = v.to_le_bytes();
+        v
+    } else {
+        let Some((off, false)) = ent_target(map, p, 4) else { return false };
+        let Some(word) = ents.get_mut(off..).and_then(<[u8]>::first_chunk_mut::<4>) else {
+            return false;
+        };
+        let v = apply(f32::from_le_bytes(*word));
+        *word = v.to_le_bytes();
+        v
+    };
+    setf(w, oc, v);
+    true
+}
+
+/// The first bytes of region S, which the interpreter can reach without bounds checks when every
+/// global operand lies in them: the main progs' strings and globals, in all but huge programs.
+pub(crate) const WINDOW: usize = (1 << 22) + 16;
+
+/// Operand offsets are masked to this within the window, so the compiler can see that accesses
+/// stay in it. The mask changes no offset of a VM the window fits (see [`window_fits`]).
+const WINDOW_MASK: usize = (1 << 22) - 1;
+
+/// Whether every global operand of every progs of `core` lies in the window and every progs'
+/// statements are padded to [`CODE_WINDOW`], so the interpreter may run as [`run_window`].
+/// Operands are below `num_globals + 3` words and reach two words further for vectors;
+/// `PARM`/`RETURN` and the indexed global opcodes stay below `num_globals`.
+pub(crate) fn window_fits(core: &Core) -> bool {
+    core.mem.s.len() >= WINDOW
+        && core.progs.iter().all(|ps| {
+            let words = u64::from(ps.num_globals()).saturating_add(5);
+            u64::from(ps.gbase).saturating_add(words.saturating_mul(4)) <= WINDOW_MASK as u64
+                && ps.code.len() == CODE_WINDOW
+        })
+}
+
+/// Word access to region S for the interpreter's operands.
+pub(crate) trait Words {
+    /// The four bytes at `o`, if they are in range.
+    fn word(&self, o: usize) -> Option<&[u8; 4]>;
+    /// The four bytes at `o`, if they are in range, for writing.
+    fn word_mut(&mut self, o: usize) -> Option<&mut [u8; 4]>;
+    /// The `N` bytes at byte address `p` (a pointer, not masked), if they lie in the view.
+    fn bytes<const N: usize>(&self, p: usize) -> Option<&[u8; N]>;
+    /// The `N` bytes at byte address `p`, if they lie in the view, for writing.
+    fn bytes_mut<const N: usize>(&mut self, p: usize) -> Option<&mut [u8; N]>;
+}
+
+/// All of region S, bounds-checked.
+impl Words for [u8] {
+    #[inline(always)]
+    fn bytes<const N: usize>(&self, p: usize) -> Option<&[u8; N]> {
+        self.get(p..)?.first_chunk::<N>()
+    }
+
+    #[inline(always)]
+    fn bytes_mut<const N: usize>(&mut self, p: usize) -> Option<&mut [u8; N]> {
+        self.get_mut(p..)?.first_chunk_mut::<N>()
+    }
+
+    #[inline(always)]
+    fn word(&self, o: usize) -> Option<&[u8; 4]> {
+        self.get(o..o.wrapping_add(4))?.first_chunk::<4>()
+    }
+
+    #[inline(always)]
+    fn word_mut(&mut self, o: usize) -> Option<&mut [u8; 4]> {
+        self.get_mut(o..o.wrapping_add(4))?.first_chunk_mut::<4>()
+    }
+}
+
+/// The window: masked offsets are always in range, so no check remains.
+impl Words for [u8; WINDOW] {
+    #[inline(always)]
+    fn bytes<const N: usize>(&self, p: usize) -> Option<&[u8; N]> {
+        self.get(p..)?.first_chunk::<N>()
+    }
+
+    #[inline(always)]
+    fn bytes_mut<const N: usize>(&mut self, p: usize) -> Option<&mut [u8; N]> {
+        self.get_mut(p..)?.first_chunk_mut::<N>()
+    }
+
+    #[inline(always)]
+    fn word(&self, o: usize) -> Option<&[u8; 4]> {
+        let o = o & WINDOW_MASK;
+        self.get(o..o.wrapping_add(4))?.first_chunk::<4>()
+    }
+
+    #[inline(always)]
+    fn word_mut(&mut self, o: usize) -> Option<&mut [u8; 4]> {
+        let o = o & WINDOW_MASK;
+        self.get_mut(o..o.wrapping_add(4))?.first_chunk_mut::<4>()
+    }
+}
+
+/// Statements of a progs padded to this many (with the jump-out-of-range sentinel), when it has
+/// no more, so the window instance can fetch them without bounds checks.
+pub(crate) const CODE_WINDOW: usize = 1 << 16;
+
+/// Statement fetch for the interpreter.
+pub(crate) trait Code {
+    /// The statement at `pc`, if there is one.
+    fn at(&self, pc: u32) -> Option<&Stmt>;
+}
+
+/// Any progs' statements, bounds-checked.
+impl Code for [Stmt] {
+    #[inline(always)]
+    fn at(&self, pc: u32) -> Option<&Stmt> {
+        self.get(usize_from(pc))
+    }
+}
+
+/// Padded statements: `pc` never reaches their end, and past a progs' own statements lies the
+/// sentinel, so the index is masked and no check remains.
+impl Code for [Stmt; CODE_WINDOW] {
+    #[inline(always)]
+    fn at(&self, pc: u32) -> Option<&Stmt> {
+        self.get(usize_from(pc) & CODE_WINDOW.wrapping_sub(1))
+    }
+}
+
+/// How the interpreter reaches its operands in region S, and its statements.
+pub(crate) trait View {
+    /// What it reads and writes operands in.
+    type Words: Words + ?Sized;
+    /// What it fetches statements from.
+    type Code: Code + ?Sized;
+    /// That view of region S.
+    fn view(s: &mut [u8]) -> Option<&mut Self::Words>;
+    /// That view of a progs' statements.
+    fn code(stmts: &[Stmt]) -> Option<&Self::Code>;
+}
+
+/// Operands anywhere in region S.
+pub(crate) enum Whole {}
+
+impl View for Whole {
+    type Words = [u8];
+    type Code = [Stmt];
+
+    #[inline(always)]
+    fn view(s: &mut [u8]) -> Option<&mut [u8]> {
+        Some(s)
+    }
+
+    #[inline(always)]
+    fn code(stmts: &[Stmt]) -> Option<&[Stmt]> {
+        Some(stmts)
+    }
+}
+
+/// Operands in the [`WINDOW`].
+pub(crate) enum Window {}
+
+impl View for Window {
+    type Words = [u8; WINDOW];
+    type Code = [Stmt; CODE_WINDOW];
+
+    #[inline(always)]
+    fn view(s: &mut [u8]) -> Option<&mut [u8; WINDOW]> {
+        s.first_chunk_mut::<WINDOW>()
+    }
+
+    #[inline(always)]
+    fn code(stmts: &[Stmt]) -> Option<&[Stmt; CODE_WINDOW]> {
+        stmts.first_chunk::<CODE_WINDOW>()
+    }
 }
 
 /// Runs until the frame stack returns to `exit_depth`, a builtin must be called, or a fault.
-/// With `TRACE`, also stops before every statement that has not been reported yet.
-fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit {
+/// With `TRACE`, also stops before every statement that has not been reported yet. Operands are
+/// read and written through the view `V`.
+fn run<const TRACE: bool, V: View>(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit {
     // The current progs' relocated statements, cloned once and refreshed only when a call or
     // return switches progs (not on every call, which would cost two atomic operations each).
     let mut cached_pr = u8::MAX;
-    let mut cached: Arc<[crate::progs::Stmt]> = match core.progs.first() {
+    let mut cached: Arc<[Stmt]> = match core.progs.first() {
         Some(p) => Arc::clone(&p.code),
         None => return Exit::Fault(ErrorKind::InvalidFunction(FuncRef::NULL)),
     };
@@ -112,7 +407,10 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
             cached = Arc::clone(&ps.code);
             cached_pr = prnum;
         }
-        let stmts: &[crate::progs::Stmt] = &cached;
+        let stmts: &[Stmt] = &cached;
+        let Some(code) = V::code(stmts) else {
+            return Exit::Fault(ErrorKind::JumpOutOfRange);
+        };
         let gb = usize_from(ps.gbase);
         let gbase_u32 = ps.gbase;
         let ng = ps.num_globals();
@@ -143,6 +441,23 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
             }};
         }
 
+        // Operands are read and written through `w`, a view of region S held from statement to
+        // statement. An arm that needs all of `core` takes it again afterwards (`rewin!`).
+        macro_rules! view {
+            () => {
+                match V::view(core.mem.s.as_mut_slice()) {
+                    Some(w) => w,
+                    None => fault!(ErrorKind::BadPointerRead(0)),
+                }
+            };
+        }
+        let mut w = view!();
+        macro_rules! rewin {
+            () => {
+                w = view!();
+            };
+        }
+
         loop {
             if TRACE {
                 if !core.traced {
@@ -152,11 +467,10 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                 }
                 core.traced = false;
             }
-            let Some(&st) = stmts.get(usize_from(pc)) else {
+            let Some(&st) = code.at(pc) else {
                 fault!(ErrorKind::JumpOutOfRange);
             };
             let (oa, ob, oc) = (usize_from(st.a), usize_from(st.b), usize_from(st.c));
-            let s = core.mem.s.as_mut_slice();
 
             // The parts of `Memory` that map a pointer to region S or E, borrowed apart from both.
             macro_rules! pointer_map {
@@ -171,86 +485,86 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
             }
             macro_rules! f3 {
                 ($op:tt) => {{
-                    let v = gf(s, oa) $op gf(s, ob);
-                    setf(s, oc, v);
+                    let v = gf(w, oa) $op gf(w, ob);
+                    setf(w, oc, v);
                 }};
             }
             macro_rules! v3 {
                 ($op:tt) => {{
                     for k in [0usize, 4, 8] {
-                        let v = gf(s, oa.wrapping_add(k)) $op gf(s, ob.wrapping_add(k));
-                        setf(s, oc.wrapping_add(k), v);
+                        let v = gf(w, oa.wrapping_add(k)) $op gf(w, ob.wrapping_add(k));
+                        setf(w, oc.wrapping_add(k), v);
                     }
                 }};
             }
             macro_rules! cmp_f {
                 ($op:tt) => {{
-                    let v = fbool(gf(s, oa) $op gf(s, ob));
-                    set(s, oc, v);
+                    let v = fbool(gf(w, oa) $op gf(w, ob));
+                    set(w, oc, v);
                 }};
             }
             macro_rules! cmp_i {
                 ($op:tt) => {{
-                    let v = ibool((g(s, oa).cast_signed()) $op (g(s, ob).cast_signed()));
-                    set(s, oc, v);
+                    let v = ibool((g(w, oa).cast_signed()) $op (g(w, ob).cast_signed()));
+                    set(w, oc, v);
                 }};
             }
             macro_rules! cmp_if {
                 ($op:tt) => {{
-                    let v = ibool((g(s, oa).cast_signed() as f32) $op gf(s, ob));
-                    set(s, oc, v);
+                    let v = ibool((g(w, oa).cast_signed() as f32) $op gf(w, ob));
+                    set(w, oc, v);
                 }};
             }
             macro_rules! cmp_fi {
                 ($op:tt) => {{
-                    let v = ibool(gf(s, oa) $op (g(s, ob).cast_signed() as f32));
-                    set(s, oc, v);
+                    let v = ibool(gf(w, oa) $op (g(w, ob).cast_signed() as f32));
+                    set(w, oc, v);
                 }};
             }
             macro_rules! i64_op {
                 ($f:expr) => {{
-                    let a = join64(g(s, oa), g(s, oa.wrapping_add(4))).cast_signed();
-                    let b = join64(g(s, ob), g(s, ob.wrapping_add(4))).cast_signed();
+                    let a = join64(g(w, oa), g(w, oa.wrapping_add(4))).cast_signed();
+                    let b = join64(g(w, ob), g(w, ob.wrapping_add(4))).cast_signed();
                     let f: fn(i64, i64) -> i64 = $f;
                     let (lo, hi) = split64(f(a, b).cast_unsigned());
-                    set(s, oc, lo);
-                    set(s, oc.wrapping_add(4), hi);
+                    set(w, oc, lo);
+                    set(w, oc.wrapping_add(4), hi);
                 }};
             }
             macro_rules! i64_cmp {
                 ($f:expr) => {{
-                    let a = join64(g(s, oa), g(s, oa.wrapping_add(4)));
-                    let b = join64(g(s, ob), g(s, ob.wrapping_add(4)));
+                    let a = join64(g(w, oa), g(w, oa.wrapping_add(4)));
+                    let b = join64(g(w, ob), g(w, ob.wrapping_add(4)));
                     let f: fn(u64, u64) -> bool = $f;
-                    set(s, oc, ibool(f(a, b)));
+                    set(w, oc, ibool(f(a, b)));
                 }};
             }
             macro_rules! d_op {
                 ($op:tt) => {{
-                    let a = f64::from_bits(join64(g(s, oa), g(s, oa.wrapping_add(4))));
-                    let b = f64::from_bits(join64(g(s, ob), g(s, ob.wrapping_add(4))));
+                    let a = f64::from_bits(join64(g(w, oa), g(w, oa.wrapping_add(4))));
+                    let b = f64::from_bits(join64(g(w, ob), g(w, ob.wrapping_add(4))));
                     let (lo, hi) = split64((a $op b).to_bits());
-                    set(s, oc, lo);
-                    set(s, oc.wrapping_add(4), hi);
+                    set(w, oc, lo);
+                    set(w, oc.wrapping_add(4), hi);
                 }};
             }
             macro_rules! d_cmp {
                 ($op:tt) => {{
-                    let a = f64::from_bits(join64(g(s, oa), g(s, oa.wrapping_add(4))));
-                    let b = f64::from_bits(join64(g(s, ob), g(s, ob.wrapping_add(4))));
-                    set(s, oc, ibool(a $op b));
+                    let a = f64::from_bits(join64(g(w, oa), g(w, oa.wrapping_add(4))));
+                    let b = f64::from_bits(join64(g(w, ob), g(w, ob.wrapping_add(4))));
+                    set(w, oc, ibool(a $op b));
                 }};
             }
             macro_rules! set64 {
                 ($off:expr, $v:expr) => {{
                     let (lo, hi) = split64($v);
-                    set(s, $off, lo);
-                    set(s, $off.wrapping_add(4), hi);
+                    set(w, $off, lo);
+                    set(w, $off.wrapping_add(4), hi);
                 }};
             }
             macro_rules! get64 {
                 ($off:expr) => {
-                    join64(g(s, $off), g(s, $off.wrapping_add(4)))
+                    join64(g(w, $off), g(w, $off.wrapping_add(4)))
                 };
             }
 
@@ -261,29 +575,29 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                 Op::AddF => f3!(+),
                 Op::SubF => f3!(-),
                 Op::MulV => {
-                    let a = gv(s, oa);
-                    let b = gv(s, ob);
-                    setf(s, oc, a[0] * b[0] + a[1] * b[1] + a[2] * b[2]);
+                    let a = gv(w, oa);
+                    let b = gv(w, ob);
+                    setf(w, oc, a[0] * b[0] + a[1] * b[1] + a[2] * b[2]);
                 }
                 Op::MulFV => {
-                    let f = gf(s, oa);
+                    let f = gf(w, oa);
                     for k in [0usize, 4, 8] {
-                        let v = f * gf(s, ob.wrapping_add(k));
-                        setf(s, oc.wrapping_add(k), v);
+                        let v = f * gf(w, ob.wrapping_add(k));
+                        setf(w, oc.wrapping_add(k), v);
                     }
                 }
                 Op::MulVF => {
-                    let f = gf(s, ob);
+                    let f = gf(w, ob);
                     for k in [0usize, 4, 8] {
-                        let v = gf(s, oa.wrapping_add(k)) * f;
-                        setf(s, oc.wrapping_add(k), v);
+                        let v = gf(w, oa.wrapping_add(k)) * f;
+                        setf(w, oc.wrapping_add(k), v);
                     }
                 }
                 Op::DivVF => {
-                    let f = gf(s, ob);
+                    let f = gf(w, ob);
                     for k in [0usize, 4, 8] {
-                        let v = gf(s, oa.wrapping_add(k)) / f;
-                        setf(s, oc.wrapping_add(k), v);
+                        let v = gf(w, oa.wrapping_add(k)) / f;
+                        setf(w, oc.wrapping_add(k), v);
                     }
                 }
                 Op::AddV => v3!(+),
@@ -297,105 +611,107 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                 Op::LtF => cmp_f!(<),
                 Op::GtF => cmp_f!(>),
                 Op::EqV => {
-                    let (a, b) = (gv(s, oa), gv(s, ob));
-                    set(s, oc, fbool(a[0] == b[0] && a[1] == b[1] && a[2] == b[2]));
+                    let (a, b) = (gv(w, oa), gv(w, ob));
+                    set(w, oc, fbool(a[0] == b[0] && a[1] == b[1] && a[2] == b[2]));
                 }
                 Op::NeV => {
-                    let (a, b) = (gv(s, oa), gv(s, ob));
-                    set(s, oc, fbool(a[0] != b[0] || a[1] != b[1] || a[2] != b[2]));
+                    let (a, b) = (gv(w, oa), gv(w, ob));
+                    set(w, oc, fbool(a[0] != b[0] || a[1] != b[1] || a[2] != b[2]));
                 }
                 Op::EqE | Op::EqFnc => {
-                    let v = fbool(g(s, oa) == g(s, ob));
-                    set(s, oc, v);
+                    let v = fbool(g(w, oa) == g(w, ob));
+                    set(w, oc, v);
                 }
                 Op::NeE | Op::NeFnc => {
-                    let v = fbool(g(s, oa) != g(s, ob));
-                    set(s, oc, v);
+                    let v = fbool(g(w, oa) != g(w, ob));
+                    set(w, oc, v);
                 }
                 Op::EqS | Op::NeS => {
-                    let (a, b) = (g(s, oa), g(s, ob));
+                    let (a, b) = (g(w, oa), g(w, ob));
                     core.x.pc = pc;
                     let v = string_compare(core, st.op, a, b);
                     core.mem.set_g(oc, v);
+                    rewin!();
                 }
 
                 // ---- logic ---------------------------------------------------------------
                 Op::NotF => {
-                    let v = fbool(!float_true(g(s, oa)));
-                    set(s, oc, v);
+                    let v = fbool(!float_true(g(w, oa)));
+                    set(w, oc, v);
                 }
                 Op::NotV => {
-                    let a = gv(s, oa);
-                    set(s, oc, fbool(a[0] == 0.0 && a[1] == 0.0 && a[2] == 0.0));
+                    let a = gv(w, oa);
+                    set(w, oc, fbool(a[0] == 0.0 && a[1] == 0.0 && a[2] == 0.0));
                 }
                 Op::NotS => {
-                    let r = g(s, oa);
+                    let r = g(w, oa);
                     core.x.pc = pc;
                     let empty = r == 0 || str_or_warn(core, r).is_empty();
                     core.mem.set_g(oc, fbool(empty));
+                    rewin!();
                 }
                 Op::NotEnt => {
-                    let v = fbool(g(s, oa) == 0);
-                    set(s, oc, v);
+                    let v = fbool(g(w, oa) == 0);
+                    set(w, oc, v);
                 }
                 Op::NotFnc => {
-                    let v = fbool(g(s, oa) & 0x00FF_FFFF == 0);
-                    set(s, oc, v);
+                    let v = fbool(g(w, oa) & 0x00FF_FFFF == 0);
+                    set(w, oc, v);
                 }
                 Op::NotI => {
-                    let v = ibool(g(s, oa) == 0);
-                    set(s, oc, v);
+                    let v = ibool(g(w, oa) == 0);
+                    set(w, oc, v);
                 }
                 Op::AndF => {
-                    let v = fbool(float_true(g(s, oa)) && float_true(g(s, ob)));
-                    set(s, oc, v);
+                    let v = fbool(float_true(g(w, oa)) && float_true(g(w, ob)));
+                    set(w, oc, v);
                 }
                 Op::OrF => {
-                    let v = fbool(float_true(g(s, oa)) || float_true(g(s, ob)));
-                    set(s, oc, v);
+                    let v = fbool(float_true(g(w, oa)) || float_true(g(w, ob)));
+                    set(w, oc, v);
                 }
                 Op::BitAndF => {
-                    let v = (f2i(gf(s, oa)) & f2i(gf(s, ob))) as f32;
-                    setf(s, oc, v);
+                    let v = (f2i(gf(w, oa)) & f2i(gf(w, ob))) as f32;
+                    setf(w, oc, v);
                 }
                 Op::BitOrF => {
-                    let v = (f2i(gf(s, oa)) | f2i(gf(s, ob))) as f32;
-                    setf(s, oc, v);
+                    let v = (f2i(gf(w, oa)) | f2i(gf(w, ob))) as f32;
+                    setf(w, oc, v);
                 }
 
                 // ---- branches ------------------------------------------------------------
                 Op::IfI => {
-                    if g(s, oa) != 0 {
+                    if g(w, oa) != 0 {
                         jump!(st.b);
                     }
                     tick!();
                 }
                 Op::IfNotI => {
-                    if g(s, oa) == 0 {
+                    if g(w, oa) == 0 {
                         jump!(st.b);
                     }
                     tick!();
                 }
                 Op::IfF => {
-                    if float_true(g(s, oa)) {
+                    if float_true(g(w, oa)) {
                         jump!(st.b);
                     }
                     tick!();
                 }
                 Op::IfNotF => {
-                    if !float_true(g(s, oa)) {
+                    if !float_true(g(w, oa)) {
                         jump!(st.b);
                     }
                     tick!();
                 }
                 Op::IfS => {
-                    if g(s, oa) != 0 {
+                    if g(w, oa) != 0 {
                         jump!(st.b);
                     }
                     tick!();
                 }
                 Op::IfNotS => {
-                    if g(s, oa) == 0 {
+                    if g(w, oa) == 0 {
                         jump!(st.b);
                     }
                     tick!();
@@ -410,25 +726,26 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                 | Op::LoadFnc
                 | Op::LoadI
                 | Op::LoadP => {
-                    let (e, f) = (g(s, oa), g(s, ob));
+                    let (e, f) = (g(w, oa), g(w, ob));
                     let (ents, shift, fb) =
                         (&core.mem.e, core.mem.stride_shift, core.mem.field_bytes);
-                    if let Some(w) = ent_field::<4>(ents, shift, fb, e, f) {
-                        set(s, oc, u32::from_le_bytes(*w));
+                    if let Some(field) = ent_field::<4>(ents, shift, fb, e, f) {
+                        set(w, oc, u32::from_le_bytes(*field));
                     } else {
                         core.x.pc = pc;
                         bad_field_access(core, e, f);
                         core.mem.set_g(oc, 0);
                     }
+                    rewin!();
                 }
                 Op::LoadV => {
-                    let (e, f) = (g(s, oa), g(s, ob));
+                    let (e, f) = (g(w, oa), g(w, ob));
                     let (ents, shift, fb) =
                         (&core.mem.e, core.mem.stride_shift, core.mem.field_bytes);
-                    if let Some(w) = ent_field::<12>(ents, shift, fb, e, f) {
-                        for (k, chunk) in w.chunks_exact(4).enumerate() {
+                    if let Some(field) = ent_field::<12>(ents, shift, fb, e, f) {
+                        for (k, chunk) in field.chunks_exact(4).enumerate() {
                             let v = chunk.first_chunk::<4>().map_or(0, |c| u32::from_le_bytes(*c));
-                            set(s, oc.wrapping_add(k.wrapping_mul(4)), v);
+                            set(w, oc.wrapping_add(k.wrapping_mul(4)), v);
                         }
                     } else {
                         let entity_ok = e < core.mem.num_edicts();
@@ -441,13 +758,14 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                             core.mem.set_g(oc.wrapping_add(k.wrapping_mul(4)), 0);
                         }
                     }
+                    rewin!();
                 }
                 Op::LoadI64 => {
-                    let (e, f) = (g(s, oa), g(s, ob));
+                    let (e, f) = (g(w, oa), g(w, ob));
                     let (ents, shift, fb) =
                         (&core.mem.e, core.mem.stride_shift, core.mem.field_bytes);
-                    if let Some(w) = ent_field::<8>(ents, shift, fb, e, f) {
-                        set64!(oc, u64::from_le_bytes(*w));
+                    if let Some(field) = ent_field::<8>(ents, shift, fb, e, f) {
+                        set64!(oc, u64::from_le_bytes(*field));
                     } else {
                         let entity_ok = e < core.mem.num_edicts();
                         let words: usize = if entity_ok {
@@ -463,16 +781,17 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                             core.mem.set_g(oc.wrapping_add(k.wrapping_mul(4)), 0);
                         }
                     }
+                    rewin!();
                 }
                 Op::Address => {
-                    let (e, f) = (g(s, oa), g(s, ob));
+                    let (e, f) = (g(w, oa), g(w, ob));
                     if core.mem.slots.get(usize_from(e)).is_some_and(|slot| !slot.protected) {
                         let p = core
                             .mem
                             .e_base
                             .wrapping_add(e.wrapping_shl(core.mem.stride_shift))
                             .wrapping_add(f.wrapping_mul(4));
-                        set(s, oc, p);
+                        set(w, oc, p);
                     } else if e >= core.mem.num_edicts() {
                         core.x.pc = pc;
                         core.warn(WarningKind::BadEntity(e));
@@ -484,23 +803,27 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                         let p = core.mem.field_address(e, f);
                         core.mem.set_g(oc, p);
                     }
+                    rewin!();
                 }
                 Op::StoreFieldF | Op::StoreFieldS | Op::StoreFieldI => {
-                    if !store_field_fast::<4>(core, oa, ob, oc) {
+                    if !store_field_view::<4, _>(w, &mut core.mem.e, &pointer_map!(), oa, ob, oc) {
                         core.x.pc = pc;
                         store_field(core, oa, ob, oc, 1);
+                        rewin!();
                     }
                 }
                 Op::StoreFieldV => {
-                    if !store_field_fast::<12>(core, oa, ob, oc) {
+                    if !store_field_view::<12, _>(w, &mut core.mem.e, &pointer_map!(), oa, ob, oc) {
                         core.x.pc = pc;
                         store_field(core, oa, ob, oc, 3);
+                        rewin!();
                     }
                 }
                 Op::StoreFieldI64 => {
-                    if !store_field_fast::<8>(core, oa, ob, oc) {
+                    if !store_field_view::<8, _>(w, &mut core.mem.e, &pointer_map!(), oa, ob, oc) {
                         core.x.pc = pc;
                         store_field(core, oa, ob, oc, 2);
+                        rewin!();
                     }
                 }
 
@@ -512,18 +835,18 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                 | Op::StoreFnc
                 | Op::StoreI
                 | Op::StoreP => {
-                    let v = g(s, oa);
-                    set(s, ob, v);
+                    let v = g(w, oa);
+                    set(w, ob, v);
                 }
-                Op::StoreV => copy(s, oa, ob, 3),
-                Op::StoreI64 => copy(s, oa, ob, 2),
+                Op::StoreV => copy(w, oa, ob, 3),
+                Op::StoreI64 => copy(w, oa, ob, 2),
                 Op::StoreIF => {
-                    let v = g(s, oa).cast_signed() as f32;
-                    setf(s, ob, v);
+                    let v = g(w, oa).cast_signed() as f32;
+                    setf(w, ob, v);
                 }
                 Op::StoreFI => {
-                    let v = f2i(gf(s, oa)).cast_unsigned();
-                    set(s, ob, v);
+                    let v = f2i(gf(w, oa)).cast_unsigned();
+                    set(w, ob, v);
                 }
 
                 // ---- stores through pointers ---------------------------------------------
@@ -533,76 +856,83 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                 | Op::StorePFld
                 | Op::StorePFnc
                 | Op::StorePI => {
-                    let (v, base, idx) = (g(s, oa), g(s, ob), g(s, oc));
+                    let (v, base, idx) = (g(w, oa), g(w, ob), g(w, oc));
                     let p = base.wrapping_add(idx.wrapping_mul(4));
-                    if !fast_write(s, &mut core.mem.e, pointer_map!(), p, v.to_le_bytes()) {
+                    if !ptr_write_view(w, &mut core.mem.e, &pointer_map!(), p, v.to_le_bytes()) {
                         core.x.pc = pc;
                         if let Err(k) = ptr_write(core, base, idx.wrapping_mul(4), &v.to_le_bytes())
                         {
                             fault!(k);
                         }
+                        rewin!();
                     }
                 }
                 Op::StorePV => {
-                    let (base, idx) = (g(s, ob), g(s, oc));
+                    let (base, idx) = (g(w, ob), g(w, oc));
                     let mut bytes = [0u8; 12];
                     for (k, chunk) in bytes.chunks_exact_mut(4).enumerate() {
                         chunk.copy_from_slice(
-                            &g(s, oa.wrapping_add(k.wrapping_mul(4))).to_le_bytes(),
+                            &g(w, oa.wrapping_add(k.wrapping_mul(4))).to_le_bytes(),
                         );
                     }
                     let p = base.wrapping_add(idx.wrapping_mul(4));
-                    if !fast_write(s, &mut core.mem.e, pointer_map!(), p, bytes) {
+                    if !ptr_write_view(w, &mut core.mem.e, &pointer_map!(), p, bytes) {
                         core.x.pc = pc;
                         if let Err(k) = ptr_write(core, base, idx.wrapping_mul(4), &bytes) {
                             fault!(k);
                         }
+                        rewin!();
                     }
                 }
                 Op::StorePI64 => {
-                    let (base, idx) = (g(s, ob), g(s, oc));
+                    let (base, idx) = (g(w, ob), g(w, oc));
                     let v = get64!(oa);
                     core.x.pc = pc;
                     if let Err(k) = ptr_write(core, base, idx.wrapping_mul(4), &v.to_le_bytes()) {
                         fault!(k);
                     }
+                    rewin!();
                 }
                 Op::StorePIF | Op::StorePFI => {
-                    let a = g(s, oa);
+                    let a = g(w, oa);
                     let v = if st.op == Op::StorePIF {
                         (a.cast_signed() as f32).to_bits()
                     } else {
                         f2i(f32::from_bits(a)).cast_unsigned()
                     };
-                    let (base, idx) = (g(s, ob), g(s, oc));
+                    let (base, idx) = (g(w, ob), g(w, oc));
                     core.x.pc = pc;
                     if let Err(k) = ptr_write(core, base, idx.wrapping_mul(4), &v.to_le_bytes()) {
                         fault!(k);
                     }
+                    rewin!();
                 }
                 Op::StorePC => {
-                    let v = f2i(gf(s, oa)) as u8;
-                    let (base, idx) = (g(s, ob), g(s, oc));
+                    let v = f2i(gf(w, oa)) as u8;
+                    let (base, idx) = (g(w, ob), g(w, oc));
                     core.x.pc = pc;
                     if let Err(k) = ptr_write(core, base, idx, &[v]) {
                         fault!(k);
                     }
+                    rewin!();
                 }
                 Op::StorePI8 => {
-                    let v = g(s, oa) as u8;
-                    let (base, idx) = (g(s, ob), g(s, oc));
+                    let v = g(w, oa) as u8;
+                    let (base, idx) = (g(w, ob), g(w, oc));
                     core.x.pc = pc;
                     if let Err(k) = ptr_write(core, base, idx, &[v]) {
                         fault!(k);
                     }
+                    rewin!();
                 }
                 Op::StorePI16 => {
-                    let v = g(s, oa) as u16;
-                    let (base, idx) = (g(s, ob), g(s, oc));
+                    let v = g(w, oa) as u16;
+                    let (base, idx) = (g(w, ob), g(w, oc));
                     core.x.pc = pc;
                     if let Err(k) = ptr_write(core, base, idx.wrapping_mul(2), &v.to_le_bytes()) {
                         fault!(k);
                     }
+                    rewin!();
                 }
 
                 // ---- loads through pointers ----------------------------------------------
@@ -612,28 +942,43 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                 | Op::LoadPFld
                 | Op::LoadPFnc
                 | Op::LoadPI => {
-                    let (base, idx) = (g(s, oa), g(s, ob));
-                    core.x.pc = pc;
-                    match ptr_read::<4>(core, base, idx.wrapping_mul(4)) {
-                        Ok(b) => core.mem.set_g(oc, u32::from_le_bytes(b)),
-                        Err(k) => fault!(k),
+                    let (base, idx) = (g(w, oa), g(w, ob));
+                    let p = base.wrapping_add(idx.wrapping_mul(4));
+                    if let Some(b) = ptr_read_view::<4, _>(w, &core.mem.e, &pointer_map!(), p) {
+                        set(w, oc, u32::from_le_bytes(b));
+                    } else {
+                        core.x.pc = pc;
+                        match ptr_read::<4>(core, base, idx.wrapping_mul(4)) {
+                            Ok(b) => core.mem.set_g(oc, u32::from_le_bytes(b)),
+                            Err(k) => fault!(k),
+                        }
+                        rewin!();
                     }
                 }
                 Op::LoadPV => {
-                    let (base, idx) = (g(s, oa), g(s, ob));
-                    core.x.pc = pc;
-                    match ptr_read::<12>(core, base, idx.wrapping_mul(4)) {
-                        Ok(b) => {
-                            for (k, w) in b.chunks_exact(4).enumerate() {
-                                let v = crate::bytes::u32_at(w, 0).unwrap_or(0);
-                                core.mem.set_g(oc.wrapping_add(k.wrapping_mul(4)), v);
-                            }
+                    let (base, idx) = (g(w, oa), g(w, ob));
+                    let p = base.wrapping_add(idx.wrapping_mul(4));
+                    if let Some(b) = ptr_read_view::<12, _>(w, &core.mem.e, &pointer_map!(), p) {
+                        for (k, chunk) in b.chunks_exact(4).enumerate() {
+                            let v = chunk.first_chunk::<4>().map_or(0, |c| u32::from_le_bytes(*c));
+                            set(w, oc.wrapping_add(k.wrapping_mul(4)), v);
                         }
-                        Err(k) => fault!(k),
+                    } else {
+                        core.x.pc = pc;
+                        match ptr_read::<12>(core, base, idx.wrapping_mul(4)) {
+                            Ok(b) => {
+                                for (k, chunk) in b.chunks_exact(4).enumerate() {
+                                    let v = crate::bytes::u32_at(chunk, 0).unwrap_or(0);
+                                    core.mem.set_g(oc.wrapping_add(k.wrapping_mul(4)), v);
+                                }
+                            }
+                            Err(k) => fault!(k),
+                        }
+                        rewin!();
                     }
                 }
                 Op::LoadPI64 => {
-                    let (base, idx) = (g(s, oa), g(s, ob));
+                    let (base, idx) = (g(w, oa), g(w, ob));
                     core.x.pc = pc;
                     match ptr_read::<8>(core, base, idx.wrapping_mul(4)) {
                         Ok(b) => {
@@ -643,18 +988,20 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                         }
                         Err(k) => fault!(k),
                     }
+                    rewin!();
                 }
                 Op::LoadPC => {
-                    let base = g(s, oa);
-                    let idx = f2i(gf(s, ob)).cast_unsigned();
+                    let base = g(w, oa);
+                    let idx = f2i(gf(w, ob)).cast_unsigned();
                     core.x.pc = pc;
                     match ptr_read::<1>(core, base, idx) {
                         Ok([b]) => core.mem.set_gf(oc, f32::from(b)),
                         Err(k) => fault!(k),
                     }
+                    rewin!();
                 }
                 Op::LoadPU8 | Op::LoadPI8 => {
-                    let (base, idx) = (g(s, oa), g(s, ob));
+                    let (base, idx) = (g(w, oa), g(w, ob));
                     core.x.pc = pc;
                     match ptr_read::<1>(core, base, idx) {
                         Ok([b]) => {
@@ -667,9 +1014,10 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                         }
                         Err(k) => fault!(k),
                     }
+                    rewin!();
                 }
                 Op::LoadPU16 | Op::LoadPI16 => {
-                    let (base, idx) = (g(s, oa), g(s, ob));
+                    let (base, idx) = (g(w, oa), g(w, ob));
                     core.x.pc = pc;
                     match ptr_read::<2>(core, base, idx.wrapping_mul(2)) {
                         Ok(b) => {
@@ -683,10 +1031,11 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                         }
                         Err(k) => fault!(k),
                     }
+                    rewin!();
                 }
                 Op::LoadPItoF | Op::LoadPFtoI => {
                     // FTE: operand B is ignored and there is no fallback.
-                    let p = g(s, oa);
+                    let p = g(w, oa);
                     match core.mem.read_u32(p) {
                         Some(w) => {
                             let v = if st.op == Op::LoadPItoF {
@@ -698,62 +1047,59 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                         }
                         None => fault!(ErrorKind::BadPointerRead(p)),
                     }
+                    rewin!();
                 }
 
                 // ---- Hexen 2 compound stores ---------------------------------------------
                 Op::MulStoreF => {
-                    let v = gf(s, ob) * gf(s, oa);
-                    setf(s, ob, v);
+                    let v = gf(w, ob) * gf(w, oa);
+                    setf(w, ob, v);
                 }
                 Op::DivStoreF => {
-                    let v = gf(s, ob) / gf(s, oa);
-                    setf(s, ob, v);
+                    let v = gf(w, ob) / gf(w, oa);
+                    setf(w, ob, v);
                 }
                 Op::AddStoreF => {
-                    let v = gf(s, ob) + gf(s, oa);
-                    setf(s, ob, v);
+                    let v = gf(w, ob) + gf(w, oa);
+                    setf(w, ob, v);
                 }
                 Op::SubStoreF => {
-                    let v = gf(s, ob) - gf(s, oa);
-                    setf(s, ob, v);
+                    let v = gf(w, ob) - gf(w, oa);
+                    setf(w, ob, v);
                 }
                 Op::MulStoreVF => {
-                    let f = gf(s, oa);
+                    let f = gf(w, oa);
                     for k in [0usize, 4, 8] {
-                        let v = gf(s, ob.wrapping_add(k)) * f;
-                        setf(s, ob.wrapping_add(k), v);
+                        let v = gf(w, ob.wrapping_add(k)) * f;
+                        setf(w, ob.wrapping_add(k), v);
                     }
                 }
                 Op::AddStoreV | Op::SubStoreV => {
                     for k in [0usize, 4, 8] {
-                        let (b, a) = (gf(s, ob.wrapping_add(k)), gf(s, oa.wrapping_add(k)));
+                        let (b, a) = (gf(w, ob.wrapping_add(k)), gf(w, oa.wrapping_add(k)));
                         let v = if st.op == Op::AddStoreV { b + a } else { b - a };
-                        setf(s, ob.wrapping_add(k), v);
+                        setf(w, ob.wrapping_add(k), v);
                     }
                 }
                 Op::BitSetStoreF => {
-                    let v = (f2i(gf(s, ob)) | f2i(gf(s, oa))) as f32;
-                    setf(s, ob, v);
+                    let v = (f2i(gf(w, ob)) | f2i(gf(w, oa))) as f32;
+                    setf(w, ob, v);
                 }
                 Op::BitClrStoreF => {
-                    let v = (f2i(gf(s, ob)) & !f2i(gf(s, oa))) as f32;
-                    setf(s, ob, v);
+                    let v = (f2i(gf(w, ob)) & !f2i(gf(w, oa))) as f32;
+                    setf(w, ob, v);
                 }
-                Op::MulStorePF | Op::DivStorePF | Op::AddStorePF | Op::SubStorePF
-                    if compound_store_fast(
-                        s,
-                        &mut core.mem.e,
-                        pointer_map!(),
-                        st.op,
-                        oa,
-                        ob,
-                        oc,
-                    ) => {}
-                Op::MulStorePF
-                | Op::DivStorePF
-                | Op::AddStorePF
-                | Op::SubStorePF
-                | Op::MulStorePVF
+                Op::MulStorePF | Op::DivStorePF | Op::AddStorePF | Op::SubStorePF => {
+                    let e = &mut core.mem.e;
+                    if !compound_store_view(w, e, &pointer_map!(), st.op, oa, ob, oc) {
+                        core.x.pc = pc;
+                        if let Err(k) = compound_pointer_store(core, st.op, oa, ob, oc) {
+                            fault!(k);
+                        }
+                        rewin!();
+                    }
+                }
+                Op::MulStorePVF
                 | Op::AddStorePV
                 | Op::SubStorePV
                 | Op::BitSetStorePF
@@ -762,10 +1108,13 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                     if let Err(k) = compound_pointer_store(core, st.op, oa, ob, oc) {
                         fault!(k);
                     }
+                    rewin!();
                 }
 
                 // ---- Hexen 2 global arrays -----------------------------------------------
                 Op::FetchGblF | Op::FetchGblS | Op::FetchGblE | Op::FetchGblFnc | Op::FetchGblV => {
+                    // The index comes from memory: read and write in all of region S.
+                    let s = core.mem.s.as_mut_slice();
                     let base = st.a;
                     let i = f2i(gf(s, ob));
                     let Some(prefix_word) = base.checked_sub(1) else {
@@ -779,16 +1128,17 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                     let word = base.wrapping_add(i.cast_unsigned().wrapping_mul(stride));
                     let src = gb.wrapping_add(usize_from(word).wrapping_mul(4));
                     copy(s, src, oc, usize_from(stride));
+                    rewin!();
                 }
 
                 // ---- animation -----------------------------------------------------------
                 Op::State => {
-                    let op = StateOp::State { frame: gf(s, oa), think: FuncRef(g(s, ob)) };
+                    let op = StateOp::State { frame: gf(w, oa), think: FuncRef(g(w, ob)) };
                     core.x.pc = pc.wrapping_add(1);
                     return Exit::StateOp(op);
                 }
                 Op::CState | Op::CWState => {
-                    let (first, last) = (gf(s, oa), gf(s, ob));
+                    let (first, last) = (gf(w, oa), gf(w, ob));
                     let func = FuncRef::new(PrNum(prnum), core.x.func);
                     let op = if st.op == Op::CState {
                         StateOp::CState { first, last, func }
@@ -799,7 +1149,7 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                     return Exit::StateOp(op);
                 }
                 Op::ThinkTime => {
-                    let op = StateOp::ThinkTime { ent: EntRef(g(s, oa)), delay: gf(s, ob) };
+                    let op = StateOp::ThinkTime { ent: EntRef(g(w, oa)), delay: gf(w, ob) };
                     core.x.pc = pc.wrapping_add(1);
                     return Exit::StateOp(op);
                 }
@@ -817,6 +1167,7 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                         }
                     };
                     setf(s, oc, v);
+                    rewin!();
                 }
                 Op::RandV0 | Op::RandV1 | Op::RandV2 => {
                     for k in [0usize, 4, 8] {
@@ -832,6 +1183,7 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                         };
                         setf(s, oc.wrapping_add(k), v);
                     }
+                    rewin!();
                 }
 
                 // ---- switch --------------------------------------------------------------
@@ -853,13 +1205,15 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                 Op::Case => {
                     let r = usize_from(core.x.switch_ref);
                     let hit = match core.x.switch_kind {
-                        SwitchKind::Float => gf(s, r) == gf(s, oa),
-                        SwitchKind::Vector => gv(s, r) == gv(s, oa),
-                        SwitchKind::Int => g(s, r) == g(s, oa),
+                        SwitchKind::Float => gf(w, r) == gf(w, oa),
+                        SwitchKind::Vector => gv(w, r) == gv(w, oa),
+                        SwitchKind::Int => g(w, r) == g(w, oa),
                         SwitchKind::String => {
-                            let (a, b) = (g(s, r), g(s, oa));
+                            let (a, b) = (g(w, r), g(w, oa));
                             core.x.pc = pc;
-                            strings_equal(core, a, b)
+                            let equal = strings_equal(core, a, b);
+                            rewin!();
+                            equal
                         }
                     };
                     if hit {
@@ -870,16 +1224,16 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                     let r = usize_from(core.x.switch_ref);
                     let hit = match core.x.switch_kind {
                         SwitchKind::Float => {
-                            let v = gf(s, r);
-                            gf(s, oa) <= v && v <= gf(s, ob)
+                            let v = gf(w, r);
+                            gf(w, oa) <= v && v <= gf(w, ob)
                         }
                         SwitchKind::Vector => {
-                            let (v, lo, hi) = (gv(s, r), gv(s, oa), gv(s, ob));
+                            let (v, lo, hi) = (gv(w, r), gv(w, oa), gv(w, ob));
                             v.iter().zip(lo).zip(hi).all(|((v, lo), hi)| lo <= *v && *v <= hi)
                         }
                         SwitchKind::Int => {
-                            let v = g(s, r).cast_signed();
-                            g(s, oa).cast_signed() <= v && v <= g(s, ob).cast_signed()
+                            let v = g(w, r).cast_signed();
+                            g(w, oa).cast_signed() <= v && v <= g(w, ob).cast_signed()
                         }
                         SwitchKind::String => fault!(ErrorKind::StringCaseRange),
                     };
@@ -911,11 +1265,11 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                     let argc = st.op.call_argc().unwrap_or(0);
                     if st.op.is_hexen2_call() {
                         if argc >= 2 {
-                            copy(s, oc, gb.wrapping_add(OFS_PARM1), 3);
+                            copy(w, oc, gb.wrapping_add(OFS_PARM1), 3);
                         }
-                        copy(s, ob, gb.wrapping_add(OFS_PARM0), 3);
+                        copy(w, ob, gb.wrapping_add(OFS_PARM0), 3);
                     }
-                    let fv = g(s, oa);
+                    let fv = g(w, oa);
                     core.argc = u32::from(argc);
                     let target = FuncRef(fv);
                     let tp = target.progs();
@@ -947,7 +1301,7 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                 }
                 Op::Return | Op::Done => {
                     tick!();
-                    copy(s, oa, gb.wrapping_add(OFS_RETURN), 3);
+                    copy(w, oa, gb.wrapping_add(OFS_RETURN), 3);
                     core.x.pc = pc;
                     core.leave();
                     if core.frames.len() <= exit_depth {
@@ -958,45 +1312,45 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
 
                 // ---- integers ------------------------------------------------------------
                 Op::AddI => {
-                    let v = g(s, oa).wrapping_add(g(s, ob));
-                    set(s, oc, v);
+                    let v = g(w, oa).wrapping_add(g(w, ob));
+                    set(w, oc, v);
                 }
                 Op::SubI => {
-                    let v = g(s, oa).wrapping_sub(g(s, ob));
-                    set(s, oc, v);
+                    let v = g(w, oa).wrapping_sub(g(w, ob));
+                    set(w, oc, v);
                 }
                 Op::MulI => {
-                    let v = g(s, oa).wrapping_mul(g(s, ob));
-                    set(s, oc, v);
+                    let v = g(w, oa).wrapping_mul(g(w, ob));
+                    set(w, oc, v);
                 }
                 Op::DivI => {
-                    let (a, b) = (g(s, oa).cast_signed(), g(s, ob).cast_signed());
+                    let (a, b) = (g(w, oa).cast_signed(), g(w, ob).cast_signed());
                     let v = match a.checked_div(b) {
                         Some(v) => v,
                         None if b == 0 => 0,
                         None => i32::MAX,
                     };
-                    set(s, oc, v.cast_unsigned());
+                    set(w, oc, v.cast_unsigned());
                 }
                 Op::BitAndI => {
-                    let v = g(s, oa) & g(s, ob);
-                    set(s, oc, v);
+                    let v = g(w, oa) & g(w, ob);
+                    set(w, oc, v);
                 }
                 Op::BitOrI => {
-                    let v = g(s, oa) | g(s, ob);
-                    set(s, oc, v);
+                    let v = g(w, oa) | g(w, ob);
+                    set(w, oc, v);
                 }
                 Op::BitXorI => {
-                    let v = g(s, oa) ^ g(s, ob);
-                    set(s, oc, v);
+                    let v = g(w, oa) ^ g(w, ob);
+                    set(w, oc, v);
                 }
                 Op::RShiftI => {
-                    let v = g(s, oa).cast_signed().wrapping_shr(g(s, ob)).cast_unsigned();
-                    set(s, oc, v);
+                    let v = g(w, oa).cast_signed().wrapping_shr(g(w, ob)).cast_unsigned();
+                    set(w, oc, v);
                 }
                 Op::LShiftI => {
-                    let v = g(s, oa).wrapping_shl(g(s, ob));
-                    set(s, oc, v);
+                    let v = g(w, oa).wrapping_shl(g(w, ob));
+                    set(w, oc, v);
                 }
                 Op::EqI => cmp_i!(==),
                 Op::NeI => cmp_i!(!=),
@@ -1005,67 +1359,67 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                 Op::LtI => cmp_i!(<),
                 Op::GtI => cmp_i!(>),
                 Op::AndI => {
-                    let v = ibool(g(s, oa) != 0 && g(s, ob) != 0);
-                    set(s, oc, v);
+                    let v = ibool(g(w, oa) != 0 && g(w, ob) != 0);
+                    set(w, oc, v);
                 }
                 Op::OrI => {
-                    let v = ibool(g(s, oa) != 0 || g(s, ob) != 0);
-                    set(s, oc, v);
+                    let v = ibool(g(w, oa) != 0 || g(w, ob) != 0);
+                    set(w, oc, v);
                 }
                 Op::ConvItoF => {
-                    let v = g(s, oa).cast_signed() as f32;
-                    setf(s, oc, v);
+                    let v = g(w, oa).cast_signed() as f32;
+                    setf(w, oc, v);
                 }
                 Op::ConvFtoI => {
-                    let v = f2i(gf(s, oa)).cast_unsigned();
-                    set(s, oc, v);
+                    let v = f2i(gf(w, oa)).cast_unsigned();
+                    set(w, oc, v);
                 }
 
                 // ---- mixed int/float -----------------------------------------------------
                 Op::AddFI => {
-                    let v = gf(s, oa) + g(s, ob).cast_signed() as f32;
-                    setf(s, oc, v);
+                    let v = gf(w, oa) + g(w, ob).cast_signed() as f32;
+                    setf(w, oc, v);
                 }
                 Op::AddIF => {
-                    let v = g(s, oa).cast_signed() as f32 + gf(s, ob);
-                    setf(s, oc, v);
+                    let v = g(w, oa).cast_signed() as f32 + gf(w, ob);
+                    setf(w, oc, v);
                 }
                 Op::SubFI => {
-                    let v = gf(s, oa) - g(s, ob).cast_signed() as f32;
-                    setf(s, oc, v);
+                    let v = gf(w, oa) - g(w, ob).cast_signed() as f32;
+                    setf(w, oc, v);
                 }
                 Op::SubIF => {
-                    let v = g(s, oa).cast_signed() as f32 - gf(s, ob);
-                    setf(s, oc, v);
+                    let v = g(w, oa).cast_signed() as f32 - gf(w, ob);
+                    setf(w, oc, v);
                 }
                 Op::MulIF => {
-                    let v = g(s, oa).cast_signed() as f32 * gf(s, ob);
-                    setf(s, oc, v);
+                    let v = g(w, oa).cast_signed() as f32 * gf(w, ob);
+                    setf(w, oc, v);
                 }
                 Op::MulFI => {
-                    let v = gf(s, oa) * g(s, ob).cast_signed() as f32;
-                    setf(s, oc, v);
+                    let v = gf(w, oa) * g(w, ob).cast_signed() as f32;
+                    setf(w, oc, v);
                 }
                 Op::DivIF => {
-                    let v = g(s, oa).cast_signed() as f32 / gf(s, ob);
-                    setf(s, oc, v);
+                    let v = g(w, oa).cast_signed() as f32 / gf(w, ob);
+                    setf(w, oc, v);
                 }
                 Op::DivFI => {
-                    let v = gf(s, oa) / g(s, ob).cast_signed() as f32;
-                    setf(s, oc, v);
+                    let v = gf(w, oa) / g(w, ob).cast_signed() as f32;
+                    setf(w, oc, v);
                 }
                 Op::MulVI => {
-                    let i = g(s, ob).cast_signed() as f32;
+                    let i = g(w, ob).cast_signed() as f32;
                     for k in [0usize, 4, 8] {
-                        let v = gf(s, oa.wrapping_add(k)) * i;
-                        setf(s, oc.wrapping_add(k), v);
+                        let v = gf(w, oa.wrapping_add(k)) * i;
+                        setf(w, oc.wrapping_add(k), v);
                     }
                 }
                 Op::MulIV => {
-                    let i = g(s, oa).cast_signed() as f32;
+                    let i = g(w, oa).cast_signed() as f32;
                     for k in [0usize, 4, 8] {
-                        let v = i * gf(s, ob.wrapping_add(k));
-                        setf(s, oc.wrapping_add(k), v);
+                        let v = i * gf(w, ob.wrapping_add(k));
+                        setf(w, oc.wrapping_add(k), v);
                     }
                 }
                 Op::LeIF => cmp_if!(<=),
@@ -1081,55 +1435,55 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                 Op::EqFI => cmp_fi!(==),
                 Op::NeFI => cmp_fi!(!=),
                 Op::BitAndIF => {
-                    let v = g(s, oa).cast_signed() & f2i(gf(s, ob));
-                    set(s, oc, v.cast_unsigned());
+                    let v = g(w, oa).cast_signed() & f2i(gf(w, ob));
+                    set(w, oc, v.cast_unsigned());
                 }
                 Op::BitOrIF => {
-                    let v = g(s, oa).cast_signed() | f2i(gf(s, ob));
-                    set(s, oc, v.cast_unsigned());
+                    let v = g(w, oa).cast_signed() | f2i(gf(w, ob));
+                    set(w, oc, v.cast_unsigned());
                 }
                 Op::BitAndFI => {
-                    let v = f2i(gf(s, oa)) & g(s, ob).cast_signed();
-                    set(s, oc, v.cast_unsigned());
+                    let v = f2i(gf(w, oa)) & g(w, ob).cast_signed();
+                    set(w, oc, v.cast_unsigned());
                 }
                 Op::BitOrFI => {
-                    let v = f2i(gf(s, oa)) | g(s, ob).cast_signed();
-                    set(s, oc, v.cast_unsigned());
+                    let v = f2i(gf(w, oa)) | g(w, ob).cast_signed();
+                    set(w, oc, v.cast_unsigned());
                 }
                 Op::AndIF => {
-                    let v = ibool(g(s, oa) != 0 && gf(s, ob) != 0.0);
-                    set(s, oc, v);
+                    let v = ibool(g(w, oa) != 0 && gf(w, ob) != 0.0);
+                    set(w, oc, v);
                 }
                 Op::OrIF => {
-                    let v = ibool(g(s, oa) != 0 || gf(s, ob) != 0.0);
-                    set(s, oc, v);
+                    let v = ibool(g(w, oa) != 0 || gf(w, ob) != 0.0);
+                    set(w, oc, v);
                 }
                 Op::AndFI => {
-                    let v = ibool(gf(s, oa) != 0.0 && g(s, ob) != 0);
-                    set(s, oc, v);
+                    let v = ibool(gf(w, oa) != 0.0 && g(w, ob) != 0);
+                    set(w, oc, v);
                 }
                 Op::OrFI => {
-                    let v = ibool(gf(s, oa) != 0.0 || g(s, ob) != 0);
-                    set(s, oc, v);
+                    let v = ibool(gf(w, oa) != 0.0 || g(w, ob) != 0);
+                    set(w, oc, v);
                 }
 
                 // ---- pointers, strings, indexed globals ----------------------------------
                 Op::GlobalAddress => {
-                    let word = st.a.wrapping_add(g(s, ob));
+                    let word = st.a.wrapping_add(g(w, ob));
                     let v = gbase_u32.wrapping_add(word.wrapping_mul(4));
-                    set(s, oc, v);
+                    set(w, oc, v);
                 }
                 Op::AddPIW => {
-                    let v = g(s, oa).wrapping_add(g(s, ob).wrapping_mul(4));
-                    set(s, oc, v);
+                    let v = g(w, oa).wrapping_add(g(w, ob).wrapping_mul(4));
+                    set(w, oc, v);
                 }
                 Op::AddSF => {
-                    let v = g(s, oa).wrapping_add(f2i(gf(s, ob)).cast_unsigned());
-                    set(s, oc, v);
+                    let v = g(w, oa).wrapping_add(f2i(gf(w, ob)).cast_unsigned());
+                    set(w, oc, v);
                 }
                 Op::SubS => {
-                    let v = g(s, oa).wrapping_sub(g(s, ob));
-                    set(s, oc, v);
+                    let v = g(w, oa).wrapping_sub(g(w, ob));
+                    set(w, oc, v);
                 }
                 Op::LoadAF
                 | Op::LoadAS
@@ -1144,12 +1498,12 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                         Op::LoadAI64 => 2,
                         _ => 1,
                     };
-                    let i = i64::from(st.a).wrapping_add(i64::from(g(s, ob).cast_signed()));
+                    let i = i64::from(st.a).wrapping_add(i64::from(g(w, ob).cast_signed()));
                     if i < 0 || i.saturating_add(i64::from(words)) > i64::from(ng) {
                         fault!(ErrorKind::ArrayIndex(i));
                     }
                     let src = gb.wrapping_add(usize::try_from(i).unwrap_or(0).wrapping_mul(4));
-                    copy(s, src, oc, usize_from(words));
+                    copy(w, src, oc, usize_from(words));
                 }
                 Op::GLoadI
                 | Op::GLoadF
@@ -1159,12 +1513,12 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                 | Op::GLoadFnc
                 | Op::GLoadV => {
                     let words: u32 = if st.op == Op::GLoadV { 3 } else { 1 };
-                    let i = g(s, oa).cast_signed();
+                    let i = g(w, oa).cast_signed();
                     if i < 0 || i64::from(i).saturating_add(i64::from(words)) > i64::from(ng) {
                         fault!(ErrorKind::ArrayIndex(i64::from(i)));
                     }
                     let src = gb.wrapping_add(usize_from(i.cast_unsigned()).wrapping_mul(4));
-                    copy(s, src, oc, usize_from(words));
+                    copy(w, src, oc, usize_from(words));
                 }
                 Op::GStorePI
                 | Op::GStorePF
@@ -1174,15 +1528,15 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                 | Op::GStorePFnc
                 | Op::GStorePV => {
                     let words: u32 = if st.op == Op::GStorePV { 3 } else { 1 };
-                    let i = g(s, ob).cast_signed();
+                    let i = g(w, ob).cast_signed();
                     if i < 0 || i64::from(i).saturating_add(i64::from(words)) > i64::from(ng) {
                         fault!(ErrorKind::ArrayIndex(i64::from(i)));
                     }
                     let dst = gb.wrapping_add(usize_from(i.cast_unsigned()).wrapping_mul(4));
-                    copy(s, oa, dst, usize_from(words));
+                    copy(w, oa, dst, usize_from(words));
                 }
                 Op::BoundCheck => {
-                    let v = g(s, oa);
+                    let v = g(w, oa);
                     if v < st.c || v >= st.b {
                         fault!(ErrorKind::BoundCheck {
                             value: v.cast_signed(),
@@ -1192,7 +1546,7 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                     }
                 }
                 Op::Push => {
-                    let words = g(s, oa);
+                    let words = g(w, oa);
                     let word = core.x.ls_top.wrapping_add(core.x.pushed);
                     let addr = core.mem.ls_base.wrapping_add(word.wrapping_mul(4));
                     let pushed = core.x.pushed.saturating_add(words);
@@ -1201,6 +1555,7 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                     }
                     core.x.pushed = pushed;
                     core.mem.set_g(oc, addr);
+                    rewin!();
                 }
                 Op::GAddress => fault!(ErrorKind::GAddress),
                 Op::Unused | Op::Pop | Op::Bad => fault!(ErrorKind::BadOpcode(st.op as u16)),
@@ -1208,28 +1563,28 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
 
                 // ---- unsigned ------------------------------------------------------------
                 Op::LeU => {
-                    let v = ibool(g(s, oa) <= g(s, ob));
-                    set(s, oc, v);
+                    let v = ibool(g(w, oa) <= g(w, ob));
+                    set(w, oc, v);
                 }
                 Op::LtU => {
-                    let v = ibool(g(s, oa) < g(s, ob));
-                    set(s, oc, v);
+                    let v = ibool(g(w, oa) < g(w, ob));
+                    set(w, oc, v);
                 }
                 Op::DivU => {
-                    let v = g(s, oa).checked_div(g(s, ob)).unwrap_or(0);
-                    set(s, oc, v);
+                    let v = g(w, oa).checked_div(g(w, ob)).unwrap_or(0);
+                    set(w, oc, v);
                 }
                 Op::RShiftU => {
-                    let v = g(s, oa).wrapping_shr(g(s, ob));
-                    set(s, oc, v);
+                    let v = g(w, oa).wrapping_shr(g(w, ob));
+                    set(w, oc, v);
                 }
                 Op::ConvUF => {
-                    let v = g(s, oa) as f32;
-                    setf(s, oc, v);
+                    let v = g(w, oa) as f32;
+                    setf(w, oc, v);
                 }
                 Op::ConvFU => {
-                    let v = f2u(gf(s, oa));
-                    set(s, oc, v);
+                    let v = f2u(gf(w, oa));
+                    set(w, oc, v);
                 }
 
                 // ---- 64-bit integers -----------------------------------------------------
@@ -1244,7 +1599,7 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                 Op::BitXorI64 => i64_op!(|a, b| a ^ b),
                 Op::LShiftI64I | Op::RShiftI64I | Op::RShiftU64I => {
                     let a = get64!(oa);
-                    let n = g(s, ob);
+                    let n = g(w, ob);
                     let v = match st.op {
                         Op::LShiftI64I => a.wrapping_shl(n),
                         Op::RShiftI64I => a.cast_signed().wrapping_shr(n).cast_unsigned(),
@@ -1263,31 +1618,31 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                     set64!(oc, a.checked_div(b).unwrap_or(0));
                 }
                 Op::ConvUI64 => {
-                    let v = u64::from(g(s, oa));
+                    let v = u64::from(g(w, oa));
                     set64!(oc, v);
                 }
                 Op::ConvII64 => {
-                    let v = i64::from(g(s, oa).cast_signed()).cast_unsigned();
+                    let v = i64::from(g(w, oa).cast_signed()).cast_unsigned();
                     set64!(oc, v);
                 }
                 Op::ConvI64I => {
-                    let v = g(s, oa);
-                    set(s, oc, v);
+                    let v = g(w, oa);
+                    set(w, oc, v);
                 }
                 Op::ConvI64F => {
                     let v = get64!(oa).cast_signed() as f32;
-                    setf(s, oc, v);
+                    setf(w, oc, v);
                 }
                 Op::ConvU64F => {
                     let v = get64!(oa) as f32;
-                    setf(s, oc, v);
+                    setf(w, oc, v);
                 }
                 Op::ConvFI64 => {
-                    let v = d2i64(f64::from(gf(s, oa))).cast_unsigned();
+                    let v = d2i64(f64::from(gf(w, oa))).cast_unsigned();
                     set64!(oc, v);
                 }
                 Op::ConvFU64 => {
-                    let v = d2u64(f64::from(gf(s, oa)));
+                    let v = d2u64(f64::from(gf(w, oa)));
                     set64!(oc, v);
                 }
 
@@ -1301,12 +1656,12 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                 Op::EqD => d_cmp!(==),
                 Op::NeD => d_cmp!(!=),
                 Op::ConvFD => {
-                    let v = f64::from(gf(s, oa)).to_bits();
+                    let v = f64::from(gf(w, oa)).to_bits();
                     set64!(oc, v);
                 }
                 Op::ConvDF => {
                     let v = f64::from_bits(get64!(oa)) as f32;
-                    setf(s, oc, v);
+                    setf(w, oc, v);
                 }
                 Op::ConvI64D => {
                     let v = (get64!(oa).cast_signed() as f64).to_bits();
@@ -1327,27 +1682,27 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
 
                 // ---- bitfields -----------------------------------------------------------
                 Op::BitExtendI | Op::BitExtendU => {
-                    let (a, d) = (g(s, oa), g(s, ob));
-                    let (w, p) = (d & 0xFF, d >> 8);
-                    let v = if w == 0 {
+                    let (a, d) = (g(w, oa), g(w, ob));
+                    let (width, p) = (d & 0xFF, d >> 8);
+                    let v = if width == 0 {
                         0
                     } else {
-                        let up = a.wrapping_shl(32u32.wrapping_sub(w).wrapping_sub(p));
-                        let down = 32u32.wrapping_sub(w);
+                        let up = a.wrapping_shl(32u32.wrapping_sub(width).wrapping_sub(p));
+                        let down = 32u32.wrapping_sub(width);
                         if st.op == Op::BitExtendI {
                             up.cast_signed().wrapping_shr(down).cast_unsigned()
                         } else {
                             up.wrapping_shr(down)
                         }
                     };
-                    set(s, oc, v);
+                    set(w, oc, v);
                 }
                 Op::BitCopyI => {
-                    let (a, d, c) = (g(s, oa), g(s, ob), g(s, oc));
-                    let (w, p) = (d & 0xFF, d >> 8);
-                    let mask = if w >= 32 { u32::MAX } else { (1u32 << w).wrapping_sub(1) };
+                    let (a, d, c) = (g(w, oa), g(w, ob), g(w, oc));
+                    let (width, p) = (d & 0xFF, d >> 8);
+                    let mask = if width >= 32 { u32::MAX } else { (1u32 << width).wrapping_sub(1) };
                     let v = (c & !mask.wrapping_shl(p)) | (a & mask).wrapping_shl(p);
-                    set(s, oc, v);
+                    set(w, oc, v);
                 }
             }
             pc = pc.wrapping_add(1);
@@ -1357,38 +1712,40 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
 
 /// Reads a word of region S.
 #[inline(always)]
-fn g(s: &[u8], o: usize) -> u32 {
-    crate::bytes::u32_at(s, o).unwrap_or(0)
+fn g<T: Words + ?Sized>(s: &T, o: usize) -> u32 {
+    s.word(o).map_or(0, |w| u32::from_le_bytes(*w))
 }
 
 /// Reads a float of region S.
 #[inline(always)]
-fn gf(s: &[u8], o: usize) -> f32 {
+fn gf<T: Words + ?Sized>(s: &T, o: usize) -> f32 {
     f32::from_bits(g(s, o))
 }
 
 /// Reads a vector of region S.
 #[inline(always)]
-fn gv(s: &[u8], o: usize) -> [f32; 3] {
+fn gv<T: Words + ?Sized>(s: &T, o: usize) -> [f32; 3] {
     [gf(s, o), gf(s, o.wrapping_add(4)), gf(s, o.wrapping_add(8))]
 }
 
 /// Writes a word of region S (the loader guarantees operands are in range; stray writes are
 /// dropped).
 #[inline(always)]
-fn set(s: &mut [u8], o: usize, v: u32) {
-    crate::bytes::put_u32(s, o, v);
+fn set<T: Words + ?Sized>(s: &mut T, o: usize, v: u32) {
+    if let Some(w) = s.word_mut(o) {
+        *w = v.to_le_bytes();
+    }
 }
 
 /// Writes a float of region S.
 #[inline(always)]
-fn setf(s: &mut [u8], o: usize, v: f32) {
+fn setf<T: Words + ?Sized>(s: &mut T, o: usize, v: f32) {
     set(s, o, v.to_bits());
 }
 
 /// Copies words within region S in increasing order (overlap-exact, like FTE).
 #[inline(always)]
-fn copy(s: &mut [u8], src: usize, dst: usize, words: usize) {
+fn copy<T: Words + ?Sized>(s: &mut T, src: usize, dst: usize, words: usize) {
     for i in 0..words {
         let k = i.wrapping_mul(4);
         let v = g(s, src.wrapping_add(k));
@@ -1409,111 +1766,12 @@ fn ent_field<const N: usize>(ents: &[u8], shift: u32, fb: u32, e: u32, f: u32) -
     ents.get(off..)?.first_chunk::<N>()
 }
 
-/// `STOREF_*` when entity and field are valid and the entity is writable: copies `N` bytes from
-/// global `oc`. Returns false, having done nothing, otherwise.
-#[inline(always)]
-fn store_field_fast<const N: usize>(core: &mut Core, oa: usize, ob: usize, oc: usize) -> bool {
-    let s = core.mem.s.as_slice();
-    let (e, f) = (g(s, oa), g(s, ob));
-    let Some(v) = s.get(oc..).and_then(<[u8]>::first_chunk::<N>) else { return false };
-    let within = u64::from(f).wrapping_mul(4);
-    if within.wrapping_add(N as u64) > u64::from(core.mem.field_bytes)
-        || core.mem.slots.get(usize_from(e)).is_none_or(|slot| slot.protected)
-    {
-        return false;
-    }
-    let off = u64::from(e).wrapping_shl(core.mem.stride_shift).wrapping_add(within);
-    let Ok(off) = usize::try_from(off) else { return false };
-    match core.mem.e.get_mut(off..).and_then(<[u8]>::first_chunk_mut::<N>) {
-        Some(dst) => {
-            *dst = *v;
-            true
-        }
-        None => false,
-    }
-}
-
 /// What the pointer fast paths need to know about entity memory.
 struct PointerMap<'a> {
     e_base: u32,
     shift: u32,
     field_bytes: u32,
     slots: &'a [EntSlot],
-}
-
-/// Where an `n`-byte write to pointer `p` lands on the common paths: region S (`Ok`) or an
-/// unprotected entity field in region E (`Err`), tested in the same order as
-/// `Memory::locate`. `None` for everything else — null, the heap, temp strings, the sentinel,
-/// protected entities, invalid pointers — which the general path handles.
-#[inline(always)]
-fn fast_target(s_len: usize, map: &PointerMap<'_>, p: u32, n: u32) -> Option<Result<usize, usize>> {
-    let end = u64::from(p).wrapping_add(u64::from(n));
-    if end <= s_len as u64 {
-        return (p != 0).then_some(Ok(usize_from(p)));
-    }
-    let off = p.checked_sub(map.e_base)?;
-    let e = off.wrapping_shr(map.shift);
-    let within = off & 1u32.wrapping_shl(map.shift).wrapping_sub(1);
-    let slot = map.slots.get(usize_from(e))?;
-    (u64::from(within).wrapping_add(u64::from(n)) <= u64::from(map.field_bytes) && !slot.protected)
-        .then_some(Err(usize_from(off)))
-}
-
-/// Writes `bytes` through pointer `p` if it lands on a common path (see [`fast_target`]).
-/// Returns false, having written nothing, otherwise.
-#[inline(always)]
-fn fast_write<const N: usize>(
-    s: &mut [u8],
-    ents: &mut [u8],
-    map: PointerMap<'_>,
-    p: u32,
-    bytes: [u8; N],
-) -> bool {
-    let (region, o) = match fast_target(s.len(), &map, p, N as u32) {
-        Some(Ok(o)) => (s, o),
-        Some(Err(o)) => (ents, o),
-        None => return false,
-    };
-    match region.get_mut(o..).and_then(<[u8]>::first_chunk_mut::<N>) {
-        Some(dst) => {
-            *dst = bytes;
-            true
-        }
-        None => false,
-    }
-}
-
-/// `MULSTOREP_F`, `DIVSTOREP_F`, `ADDSTOREP_F`, `SUBSTOREP_F` when the pointer lands on a common
-/// path: `*B op= A`, then `C` = the new value. Returns false, having done nothing, otherwise.
-#[inline(always)]
-fn compound_store_fast(
-    s: &mut [u8],
-    ents: &mut [u8],
-    map: PointerMap<'_>,
-    op: Op,
-    oa: usize,
-    ob: usize,
-    oc: usize,
-) -> bool {
-    let (p, a) = (g(s, ob), gf(s, oa));
-    let (region, o): (&mut [u8], usize) = match fast_target(s.len(), &map, p, 4) {
-        Some(Ok(o)) => (&mut *s, o),
-        Some(Err(o)) => (ents, o),
-        None => return false,
-    };
-    let Some(word) = region.get_mut(o..).and_then(<[u8]>::first_chunk_mut::<4>) else {
-        return false;
-    };
-    let b = f32::from_le_bytes(*word);
-    let v = match op {
-        Op::MulStorePF => b * a,
-        Op::DivStorePF => b / a,
-        Op::AddStorePF => b + a,
-        _ => b - a,
-    };
-    *word = v.to_le_bytes();
-    setf(s, oc, v);
-    true
 }
 
 /// Warns about an invalid entity or field in a field load.

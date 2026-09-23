@@ -173,7 +173,7 @@ impl ProgsState {
             })
             .collect();
         Self {
-            code: relocate(&program, gbase),
+            code: pad_code(relocate(&program, gbase)),
             gbase,
             callees,
             funcs,
@@ -187,6 +187,20 @@ impl ProgsState {
     pub(crate) fn num_globals(&self) -> u32 {
         self.program.num_globals()
     }
+}
+
+/// Pads statements to [`CODE_WINDOW`](super::interp::CODE_WINDOW) with the jump-out-of-range
+/// sentinel if there are no more (see `interp::Code`); leaves longer programs alone.
+fn pad_code(code: Arc<[Stmt]>) -> Arc<[Stmt]> {
+    let size = super::interp::CODE_WINDOW;
+    if code.len() >= size {
+        return code;
+    }
+    let sentinel = Stmt { op: crate::opcode::Op::JumpOutOfRange, flags: 0, a: 0, b: 0, c: 0 };
+    let mut padded = Vec::with_capacity(size);
+    padded.extend_from_slice(&code);
+    padded.resize(size, sentinel);
+    padded.into()
 }
 
 /// A program's statements with global operands relocated from globals-relative to absolute byte

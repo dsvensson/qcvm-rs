@@ -342,6 +342,7 @@ impl<H: Host> Vm<H> {
         let callees = super::bind(&program, &self.builtins);
         let state = state_handles(&program, gbase_u32, &self.core.fields);
         self.core.progs.push(ProgsState::new(Arc::clone(&program), gbase_u32, callees, state));
+        self.window = super::interp::window_fits(&self.core);
         register_shared(&mut self.core, pr);
         link_externs(&mut self.core);
 

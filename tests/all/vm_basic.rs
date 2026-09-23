@@ -969,3 +969,38 @@ fn spawn_and_remove_hooks() {
     assert_eq!(host.spawned, [(2, 1)]);
     assert_eq!(host.removed, [(2, 7.0)]);
 }
+
+/// Programs the interpreter's window does not cover run on its bounds-checked instance: one with
+/// more statements than the padded code holds, and one with globals beyond the window.
+#[test]
+fn programs_beyond_the_window() {
+    let mut asm = Asm::new();
+    let (one, two) = (asm.float(1.0), asm.float(2.0));
+    let f = asm.function("far_code", &[], 1);
+    let t = f.local(0);
+    let skip = asm.emit(Op::Goto, 0, 0, 0);
+    for _ in 0..70_000 {
+        asm.emit(Op::AddF, t, one, t);
+    }
+    let end = asm.here();
+    asm.patch_jump(skip, 0, end);
+    asm.emit(Op::AddF, one, two, t);
+    asm.emit(Op::Return, t, 0, 0);
+    let mut vm = vm(&asm);
+    let mut host = TestHost::default();
+    let r = vm.call(&mut host, func(&vm, "far_code"), &[]).unwrap();
+    assert_eq!(r.f32(), 3.0);
+
+    // A 32-bit progs whose globals reach past the window.
+    let mut asm = Asm::new();
+    asm.alloc(1_100_000, &[]);
+    let (one, two) = (asm.float(1.0), asm.float(2.0));
+    let f = asm.function("far_globals", &[], 1);
+    asm.emit(Op::AddF, one, two, f.local(0));
+    asm.emit(Op::Return, f.local(0), 0, 0);
+    let program = Arc::new(Program::parse(&asm.build(ProgsFormat::Fte32)).unwrap());
+    let mut vm: Vm<TestHost> =
+        Vm::new(program, Arc::new(Builtins::empty(Numbering::None)), VmConfig::default()).unwrap();
+    let r = vm.call(&mut host, func(&vm, "far_globals"), &[]).unwrap();
+    assert_eq!(r.f32(), 3.0);
+}

@@ -8,7 +8,8 @@
 pub struct Limits {
     /// Maximum number of entities, including the world (FTE CSQC: 65536).
     pub max_edicts: u32,
-    /// Size of the local-variable stack in words (FTE: 1,048,576).
+    /// Size of the local-variable stack in words (FTE: 1,048,576). A smaller stack keeps the
+    /// interpreter from reaching operands through its unchecked window, which makes it slower.
     pub local_stack_words: u32,
     /// Maximum QuakeC call depth (FTE: 1024).
     pub call_depth: u32,

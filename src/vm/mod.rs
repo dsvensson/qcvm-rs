@@ -104,6 +104,8 @@ pub struct Vm<H> {
     budget: u32,
     /// When the current host call has to finish ([`Limits::deadline`]).
     deadline: Option<Instant>,
+    /// Every operand lies in the interpreter's window ([`interp::window_fits`]).
+    window: bool,
 }
 
 impl<H: Host> fmt::Debug for Vm<H> {
@@ -139,6 +141,7 @@ impl<H: Host> Vm<H> {
     ) -> Result<Self, VmError> {
         let core = build_core(Arc::clone(&program), &builtins, config)?;
         Ok(Self {
+            window: interp::window_fits(&core),
             core,
             main: program,
             builtins,
@@ -157,6 +160,7 @@ impl<H: Host> Vm<H> {
     pub fn reset(&mut self) -> Result<(), VmError> {
         let program = Arc::clone(&self.main);
         self.core = build_core(program, &self.builtins, self.core.config.clone())?;
+        self.window = interp::window_fits(&self.core);
         Ok(())
     }
 
@@ -507,7 +511,11 @@ impl<H: Host> Vm<H> {
                 interp::run_traced(&mut self.core, exit_depth, &mut left)
             } else {
                 self.core.traced = false;
-                interp::run_fast(&mut self.core, exit_depth, &mut left)
+                if self.window {
+                    interp::run_window(&mut self.core, exit_depth, &mut left)
+                } else {
+                    interp::run_fast(&mut self.core, exit_depth, &mut left)
+                }
             };
             if !matches!(exit, Exit::Budget) {
                 self.budget = self.budget.saturating_sub(chunk.saturating_sub(left));

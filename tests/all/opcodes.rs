@@ -52,13 +52,14 @@ struct Out {
 
 struct Tester {
     format: ProgsFormat,
+    config: VmConfig,
     covered: BTreeSet<u16>,
 }
 
 impl Tester {
     fn vm(&self, asm: &Asm) -> Vm<TestHost> {
         let program = Arc::new(Program::parse(&asm.build(self.format)).unwrap());
-        Vm::new(program, Arc::new(Builtins::empty(Numbering::None)), VmConfig::default()).unwrap()
+        Vm::new(program, Arc::new(Builtins::empty(Numbering::None)), self.config.clone()).unwrap()
     }
 
     /// Runs `op A B C` on globals initialised to `a`, `b`, `c`.
@@ -1040,8 +1041,15 @@ fn bitfields(t: &mut Tester) {
     assert_eq!(out.c[0], 0xFFFF_F5FF);
 }
 
-fn check_all(format: ProgsFormat) {
-    let mut t = Tester { format, covered: BTreeSet::new() };
+/// Runs every opcode test. With the default configuration the interpreter reaches operands and
+/// statements through its window; `checked` shrinks the local stack below the window, which makes
+/// it use the bounds-checked instance instead.
+fn check_all(format: ProgsFormat, checked: bool) {
+    let mut config = VmConfig::default();
+    if checked {
+        config.limits.local_stack_words = 1 << 12;
+    }
+    let mut t = Tester { format, config, covered: BTreeSet::new() };
     arithmetic(&mut t);
     comparisons(&mut t);
     strings(&mut t);
@@ -1072,10 +1080,20 @@ fn check_all(format: ProgsFormat) {
 
 #[test]
 fn every_opcode_16bit() {
-    check_all(ProgsFormat::Fte16);
+    check_all(ProgsFormat::Fte16, false);
 }
 
 #[test]
 fn every_opcode_32bit() {
-    check_all(ProgsFormat::Fte32);
+    check_all(ProgsFormat::Fte32, false);
+}
+
+#[test]
+fn every_opcode_16bit_checked() {
+    check_all(ProgsFormat::Fte16, true);
+}
+
+#[test]
+fn every_opcode_32bit_checked() {
+    check_all(ProgsFormat::Fte32, true);
 }

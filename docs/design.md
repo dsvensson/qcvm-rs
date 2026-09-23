@@ -83,11 +83,21 @@ outer loop handles those and re-enters. Everything that must survive such an exi
 limit.
 
 The interpreter keeps the current progs' statements, with global operands relocated to absolute
-addresses at load time, in a local; each statement is one dense `match`. Multi-word copies
-between globals (`STORE_V`, `RETURN`, parameters) go word by word in order, as FTE's do, so
-overlapping operands behave identically; vector copies through pointers read the whole source
-first, where FTE's result depends on its C compiler (see the deviations). Float-to-int
-conversions and shifts behave as on x86 on every platform.
+addresses at load time, in a local; each statement is one dense `match`. It is compiled once, in
+this crate, behind non-generic entry points. Because the loader has validated every operand, the
+interpreter reads and writes them through a view of region S: normally a fixed-size window over
+its first 4 MiB, where every operand of the main progs lies, so masked offsets need no bounds
+checks; each progs' statements are padded to 65,536 (1 MiB) with the jump-out-of-range sentinel, so
+fetching one needs no check either. VMs the window does not cover (a progs with more statements,
+globals beyond 4 MiB, added progs, a local stack below the default) run a bounds-checked
+instance of the same code. The view is held from statement to statement; only the arms that
+need all of `Core` (calls, warnings, strings, slow paths) take it again afterwards. Entity-field
+and pointer accesses have inline fast paths that hand anything unusual to the general code.
+
+Multi-word copies between globals (`STORE_V`, `RETURN`, parameters) go word by word in order,
+as FTE's do, so overlapping operands behave identically; vector copies through pointers read
+the whole source first, where FTE's result depends on its C compiler (see the deviations).
+Float-to-int conversions and shifts behave as on x86 on every platform.
 
 Errors unwind to the entry of the current host call, restoring saved locals, and carry a
 backtrace with source lines when a `.lno` file is loaded. `abort` unwinds to the nearest host
@@ -145,7 +155,13 @@ are bounded by those limits but not counted by the runaway counter, as in FTE.
 
 ## Performance
 
-Against FTE's runner, call-heavy code runs at about the same speed and tight arithmetic or
-entity-field loops at about 1.5–1.6× FTE's time. Bounds checks and register pressure in the
-single dispatch loop account for the difference. The interpreter is much slower unoptimised, so
-depending projects should build it with `opt-level = 3` in their dev profile.
+`scripts/bench-fte.ps1` times the workloads of `tests/qc/bench.qc` in both VMs at two sizes, so
+process start-up cancels out. Per QuakeC call (fib) qcvm takes about 1.1× the time of FTE's
+runner; in tight float-arithmetic and entity-field loops about 2×, roughly 1.4–1.7 ns per
+statement against FTE's 0.7–0.9. What remains is the dispatch itself: a statement takes about
+three taken branches where FTE's switch takes two, and the loop's code generation is sensitive
+enough that unrelated changes move it by several percent. Real CSQC frames (`benches/csprogs.rs`)
+spend most of their time in builtins and the host rather than in the interpreter.
+
+The interpreter is much slower unoptimised, so depending projects should build it with
+`opt-level = 3` in their dev profile.

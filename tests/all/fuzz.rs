@@ -10,7 +10,8 @@
 //! `QCVM_FUZZ_CASES` for a longer run.
 //!
 //! Programs rich in compare-and-branch pairs also check that the interpreter behaves exactly like
-//! its tracing instance, and that stopping for the budget and resuming loses nothing.
+//! its tracing instance (with and without its window over region S), and that stopping for the
+//! budget and resuming loses nothing.
 
 use std::sync::Arc;
 
@@ -248,6 +249,12 @@ proptest! {
         let fast = outcome(&program, funcs.len(), arg, false, limits.clone());
         let traced = outcome(&program, funcs.len(), arg, true, limits.clone());
         prop_assert_eq!(fast, traced);
+
+        // With a local stack as large as the default, the interpreter reaches operands and
+        // statements through its window instead.
+        let wide = Limits { local_stack_words: 1 << 20, ..limits.clone() };
+        let fast = outcome(&program, funcs.len(), arg, false, wide.clone());
+        prop_assert_eq!(fast, outcome(&program, funcs.len(), arg, true, wide));
 
         // A budget big enough to be handed out in chunks stops the interpreter mid-run; the
         // outcome must not change.
