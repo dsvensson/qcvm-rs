@@ -17,3 +17,5 @@ mod support;
 
 mod license;
 mod loader;
+mod opcodes;
+mod vm_basic;

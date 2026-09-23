@@ -25,6 +25,7 @@ production code should leave them off.
 | 12-byte temp-string fallback read | faults | zero-fills like smaller reads | — |
 | Operand sanitizer | treats `SWITCH_*.b` as a global operand (large switches get poisoned) | `SWITCH_*.b` is a jump offset | — |
 | `DIV_I64`/`DIV_U64` | unguarded (host process traps on /0 and `MIN / -1`) | `/0 → 0`, `MIN / -1 → MIN` | — |
+| Entity limit | never allocates the last slot below `maxedicts` | allocates every slot below `Limits::max_edicts` (which counts the world) | — |
 | `FETCH_GBL_*` with `a == 0` | reads the prefix word at index −1 | faults with an array-index error | — |
 | Bitfield ops with `w == 0` or `w + p > 32` | C undefined behaviour | defined via wrapping shifts and masks | — |
 | `CSTATE`/`CWSTATE` think function | stored without the progs byte | keeps the progs byte (multiprogs-safe) | — |

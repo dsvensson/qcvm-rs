@@ -11,9 +11,21 @@
 
 #![forbid(unsafe_code)]
 
+pub mod builtins;
 mod bytes;
+pub mod error;
+pub mod host;
 pub mod opcode;
 pub mod progs;
+pub mod value;
+pub mod vm;
 
+pub use builtins::{BuiltinFn, Builtins, Numbering};
+pub use error::{ErrorKind, VmError, Warning, WarningKind};
+pub use host::{Host, NullHost};
 pub use opcode::Op;
 pub use progs::{LoadError, LoadNote, Program, ProgsFormat};
+pub use value::{
+    Arg, EntRef, Field, FieldOfs, FuncRef, Global, PrNum, Ptr, QcValue, Ret, StrRef, Vec3,
+};
+pub use vm::{Limits, LookupError, StateOp, Vm, VmConfig, VmKind};

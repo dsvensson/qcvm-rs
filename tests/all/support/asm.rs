@@ -182,10 +182,20 @@ impl Asm {
         self.alloc(3, &[v[0].to_bits(), v[1].to_bits(), v[2].to_bits()])
     }
 
+    /// Three unnamed words.
+    pub fn vector_raw(&mut self, w: [u32; 3]) -> u32 {
+        self.alloc(3, &w)
+    }
+
     /// An unnamed string constant.
     pub fn str_const(&mut self, s: &str) -> u32 {
         let ofs = self.string(s);
         self.alloc(1, &[ofs])
+    }
+
+    /// Overwrites the initial value of global word `word`.
+    pub fn set_global(&mut self, word: u32, value: u32) {
+        self.globals[word as usize] = value;
     }
 
     /// Unnamed scratch globals.
