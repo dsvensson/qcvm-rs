@@ -8,6 +8,7 @@ mod entity;
 mod hash;
 mod hostcalls;
 mod introspect;
+#[cfg(feature = "json")]
 mod json;
 mod math;
 mod memory;

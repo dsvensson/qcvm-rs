@@ -66,7 +66,7 @@ production code should leave them off.
 | `memfree` of a pointer that is not a block start | ignored silently | warns |
 | `memcmp` offsets | the implementation swaps the two offset arguments | the 4th argument offsets the first pointer, as documented |
 | Reads from `createbuffer` buffers | cannot reach the last byte | can |
-| `json_parse` | decodes `\uXXXX` from its own output buffer; unbounded nesting | decodes from the input (low surrogates up to `DFFF`); at most 256 levels |
+| `json_parse` | a lenient parser (comments, trailing commas, unquoted words as numbers, case-insensitive literals, keys verbatim) that decodes `\uXXXX` from its own output buffer, with unbounded nesting | strict JSON (RFC 8259, parsed by `serde_json`): keys and strings unescaped, at most 128 levels, a leading UTF-8 byte-order mark skipped; anything else parses to null |
 | `buf_loadfile` | splits lines longer than 8191 bytes | keeps lines whole |
 | `bufstr_set`/`bufstr_add` beyond `Limits::string_buffer_entries` | accepts index 1,048,576 | refuses it with a warning (−1 from `bufstr_add`) |
 | Hash tables, string buffers and token lists beyond `Limits::container_bytes` (64 MiB) | unbounded | `hash_createtab` returns 0, `hash_add` and `bufstr_set` do nothing, `bufstr_add` returns −1, the tokenizers stop at the budget, each with a warning |

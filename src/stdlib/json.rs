@@ -14,10 +14,19 @@
 //! ```
 //!
 //! The root comes first; the children of each object or array are contiguous, laid out in
-//! pre-order; the names follow the nodes. The parser is FTE's lenient one: `//` and `/* */`
-//! comments, trailing commas, a UTF-8 byte-order mark, unquoted words as numbers, and
-//! case-insensitive `true`/`false`/`null` are accepted; keys are used verbatim (escapes are not
-//! decoded). `\uXXXX` escapes in strings are decoded to UTF-8 (a NUL as the overlong `C0 80`).
+//! pre-order; the names follow the nodes. Objects keep their members in document order,
+//! duplicate keys included.
+//!
+//! Documents must be strict JSON (RFC 8259, parsed by `serde_json`; nesting up to 128 levels);
+//! a leading UTF-8 byte-order mark is skipped. FTE's parser is more lenient (comments, trailing
+//! commas, unquoted words, keys used verbatim). Keys and strings are unescaped; a NUL is stored
+//! as the overlong `C0 80`, since it would end a QuakeC string. A document is measured before
+//! anything is built, so one whose tree cannot fit the heap costs no memory.
+
+use std::borrow::Cow;
+use std::fmt;
+
+use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 
 use crate::builtins::Builtins;
 use crate::bytes::usize_from;
@@ -59,392 +68,209 @@ const TYPE_NULL: u32 = 6;
 
 /// Bytes per node.
 const NODE: usize = 16;
-/// Nesting deeper than this fails the parse (instead of exhausting the stack).
-const MAX_DEPTH: u32 = 256;
 
 // ---- parsing ----------------------------------------------------------------------------------
-
-/// A byte range of the input.
-#[derive(Clone, Copy, Debug)]
-struct Span {
-    start: u32,
-    end: u32,
-}
-
-impl Span {
-    fn len(self) -> usize {
-        usize_from(self.end.saturating_sub(self.start))
-    }
-
-    fn of(self, data: &[u8]) -> &[u8] {
-        data.get(usize_from(self.start)..usize_from(self.end)).unwrap_or_default()
-    }
-}
-
-/// A node's name in its parent.
-#[derive(Clone, Copy, Debug)]
-enum Name {
-    Root,
-    /// An object key, verbatim.
-    Key(Span),
-    /// An array element, named by its index.
-    Index(u32),
-}
-
-impl Name {
-    /// Bytes the name takes in the VM layout (with its NUL; empty names are null).
-    fn layout_len(self) -> usize {
-        match self {
-            Self::Root => 0,
-            Self::Key(s) if s.len() == 0 => 0,
-            Self::Key(s) => s.len().saturating_add(1),
-            Self::Index(i) => {
-                let digits = i.checked_ilog10().map_or(1, |d| d.saturating_add(1));
-                usize_from(digits).saturating_add(1)
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-enum Kind {
-    /// A string, with its escapes still encoded.
-    Str(Span),
-    /// A number (or any other unquoted word), as written.
-    Num(Span),
-    Object,
-    Array,
-    True,
-    False,
-    Null,
-}
-
-#[derive(Debug)]
-struct Node {
-    name: Name,
-    kind: Kind,
-    children: Vec<Node>,
-}
 
 /// Why a document was not parsed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Failure {
-    /// Not (FTE-flavoured) JSON.
+    /// Not valid JSON.
     Invalid,
     /// Its VM layout would exceed the limit.
     TooLarge,
 }
 
-/// A parsed document: the root (childless unless built) and the VM layout's node count and name
-/// bytes.
-#[derive(Debug)]
-struct Parsed {
-    root: Node,
-    nodes: usize,
-    names: usize,
+/// Text as stored in VM memory: a NUL (which would end a QuakeC string) becomes the overlong
+/// `C0 80`.
+fn qc_text(s: &str) -> Cow<'_, [u8]> {
+    if !s.contains('\0') {
+        return Cow::Borrowed(s.as_bytes());
+    }
+    let mut out = Vec::with_capacity(s.len().saturating_add(8));
+    for &b in s.as_bytes() {
+        if b == 0 {
+            out.extend_from_slice(&[0xC0, 0x80]);
+        } else {
+            out.push(b);
+        }
+    }
+    Cow::Owned(out)
 }
 
-struct Parser<'a> {
-    data: &'a [u8],
-    pos: usize,
-    /// Keep the tree; otherwise only validate and measure the document.
-    build: bool,
+/// Length of [`qc_text`]`(s)` without building it.
+fn qc_len(s: &str) -> usize {
+    s.len().saturating_add(s.bytes().filter(|&b| b == 0).count())
+}
+
+/// Two words as the 8 value bytes of a node.
+fn words(a: u32, b: u32) -> [u8; 8] {
+    (u64::from(a) | (u64::from(b) << 32)).to_le_bytes()
+}
+
+/// Bytes a name takes in the names area (with its NUL; an empty name is null and takes none).
+fn name_bytes(len: usize) -> usize {
+    if len == 0 { 0 } else { len.saturating_add(1) }
+}
+
+/// Decimal digits of an array index.
+fn index_digits(i: u32) -> usize {
+    usize_from(i.checked_ilog10().map_or(1, |d| d.saturating_add(1)))
+}
+
+/// A string (object keys), as its length in the names area.
+struct KeyLen;
+
+impl<'de> DeserializeSeed<'de> for KeyLen {
+    type Value = usize;
+
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<usize, D::Error> {
+        d.deserialize_str(self)
+    }
+}
+
+impl Visitor<'_> for KeyLen {
+    type Value = usize;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a key")
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<usize, E> {
+        Ok(qc_len(v))
+    }
+}
+
+/// Pass 1: validates and measures a document without building anything. Records the VM
+/// layout's node count and name bytes, and the child count of every object and array in
+/// pre-order; stops once the layout would exceed `limit`.
+#[derive(Debug)]
+struct Measure {
     nodes: usize,
     names: usize,
-    /// Most bytes the VM layout (nodes and names) may take.
     limit: usize,
+    counts: Vec<u32>,
     too_large: bool,
 }
 
-impl Parser<'_> {
-    fn at(&self, i: usize) -> u8 {
-        self.data.get(i).copied().unwrap_or(0)
-    }
+/// One node to measure, with the length of its name.
+struct MeasureNode<'m> {
+    m: &'m mut Measure,
+    name: usize,
+}
 
-    fn peek(&self) -> Option<u8> {
-        self.data.get(self.pos).copied()
-    }
+impl<'de> DeserializeSeed<'de> for MeasureNode<'_> {
+    type Value = ();
 
-    fn bump(&mut self) {
-        self.pos = self.pos.saturating_add(1);
-    }
-
-    fn span(&self, start: usize) -> Span {
-        let to = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
-        Span { start: to(start), end: to(self.pos) }
-    }
-
-    /// Skips whitespace and C/C++ comments.
-    fn skip_white(&mut self) {
-        while let Some(c) = self.peek() {
-            match c {
-                b' ' | b'\t' | b'\r' | b'\n' => self.bump(),
-                b'/' if self.pos.saturating_add(1) < self.data.len() => {
-                    match self.at(self.pos.saturating_add(1)) {
-                        b'/' => {
-                            self.pos = self.pos.saturating_add(2);
-                            while self.peek().is_some_and(|c| c != b'\r' && c != b'\n') {
-                                self.bump();
-                            }
-                        }
-                        b'*' => {
-                            self.pos = self.pos.saturating_add(2);
-                            while self.pos.saturating_add(1) < self.data.len() {
-                                if self.at(self.pos) == b'*'
-                                    && self.at(self.pos.saturating_add(1)) == b'/'
-                                {
-                                    self.pos = self.pos.saturating_add(2);
-                                    break;
-                                }
-                                self.bump();
-                            }
-                        }
-                        _ => return,
-                    }
-                }
-                _ => return,
-            }
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        let m = self.m;
+        m.nodes = m.nodes.saturating_add(1);
+        m.names = m.names.saturating_add(name_bytes(self.name));
+        if m.nodes.saturating_mul(NODE).saturating_add(m.names) > m.limit {
+            m.too_large = true;
+            return Err(de::Error::custom("the document does not fit the heap"));
         }
+        d.deserialize_any(MeasureValue(m))
+    }
+}
+
+struct MeasureValue<'m>(&'m mut Measure);
+
+impl MeasureValue<'_> {
+    /// Reserves a count slot in pre-order, for a container about to be measured.
+    fn open(&mut self) -> usize {
+        self.0.counts.push(0);
+        self.0.counts.len().saturating_sub(1)
     }
 
-    /// A quoted string (the body, escapes undecoded) or an unquoted word.
-    fn token(&mut self) -> Option<(Span, bool)> {
-        if self.peek() == Some(b'"') {
-            self.bump();
-            let start = self.pos;
-            while let Some(c) = self.peek() {
-                match c {
-                    b'"' => break,
-                    b'\\' => match self.at(self.pos.saturating_add(1)) {
-                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' | b'u' => {
-                            self.pos = self.pos.saturating_add(2);
-                        }
-                        _ => self.bump(),
-                    },
-                    _ => self.bump(),
-                }
-            }
-            if self.peek() != Some(b'"') {
-                return None;
-            }
-            let body = self.span(start);
-            self.bump();
-            Some((body, true))
-        } else {
-            let start = self.pos;
-            while self.peek().is_some_and(|c| !b" \t\r\n:,{}[]".contains(&c)) {
-                self.bump();
-            }
-            (self.pos > start).then(|| (self.span(start), false))
-        }
-    }
-
-    /// Counts a node against the layout limit.
-    fn measure(&mut self, name: Name) -> bool {
-        self.nodes = self.nodes.saturating_add(1);
-        self.names = self.names.saturating_add(name.layout_len());
-        let size = self.nodes.saturating_mul(NODE).saturating_add(self.names);
-        self.too_large = size > self.limit;
-        !self.too_large
-    }
-
-    fn node(&mut self, name: Name, depth: u32) -> Option<Node> {
-        if depth > MAX_DEPTH || !self.measure(name) {
-            return None;
-        }
-        self.skip_white();
-        let mut node = Node { name, kind: Kind::Null, children: Vec::new() };
-        match self.peek()? {
-            b'{' => {
-                self.bump();
-                self.skip_white();
-                node.kind = Kind::Object;
-                while self.peek() == Some(b'"') {
-                    let Some((key, _)) = self.token() else { break };
-                    self.skip_white();
-                    if self.peek() == Some(b':') {
-                        self.bump();
-                        match self.node(Name::Key(key), depth.saturating_add(1)) {
-                            Some(child) if self.build => node.children.push(child),
-                            Some(_) => {}
-                            None => break,
-                        }
-                    }
-                    self.skip_white();
-                    if self.peek() == Some(b',') {
-                        self.bump();
-                        self.skip_white();
-                        continue;
-                    }
-                    break;
-                }
-                (self.peek() == Some(b'}') && !self.too_large).then(|| {
-                    self.bump();
-                    node
-                })
-            }
-            b'[' => {
-                self.bump();
-                self.skip_white();
-                node.kind = Kind::Array;
-                let mut index = 0u32;
-                loop {
-                    let name = Name::Index(index);
-                    index = index.saturating_add(1);
-                    match self.node(name, depth.saturating_add(1)) {
-                        Some(child) if self.build => node.children.push(child),
-                        Some(_) => {}
-                        None => break,
-                    }
-                    if self.peek() == Some(b',') {
-                        self.bump();
-                        self.skip_white();
-                        continue;
-                    }
-                    break;
-                }
-                self.skip_white();
-                (self.peek() == Some(b']') && !self.too_large).then(|| {
-                    self.bump();
-                    node
-                })
-            }
-            _ => {
-                let (text, quoted) = self.token()?;
-                let word = text.of(self.data);
-                node.kind = if quoted {
-                    Kind::Str(text)
-                } else if word.eq_ignore_ascii_case(b"true") {
-                    Kind::True
-                } else if word.eq_ignore_ascii_case(b"false") {
-                    Kind::False
-                } else if word.eq_ignore_ascii_case(b"null") {
-                    Kind::Null
-                } else {
-                    Kind::Num(text)
-                };
-                Some(node)
-            }
+    fn close(&mut self, slot: usize, n: u32) {
+        if let Some(c) = self.0.counts.get_mut(slot) {
+            *c = n;
         }
     }
 }
 
-/// Parses a whole document (trailing garbage fails it) whose VM layout takes at most `limit`
-/// bytes. With `build` false nothing is allocated: the document is only validated and measured.
-fn parse(data: &[u8], build: bool, limit: usize) -> Result<Parsed, Failure> {
-    if u32::try_from(data.len()).is_err() {
-        return Err(Failure::TooLarge);
+impl<'de> Visitor<'de> for MeasureValue<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON value")
     }
-    let pos = if data.starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
-    let mut p = Parser { data, pos, build, nodes: 0, names: 0, limit, too_large: false };
-    let root = p.node(Name::Root, 0);
-    p.skip_white();
-    match root {
-        _ if p.too_large => Err(Failure::TooLarge),
-        Some(root) if p.pos == data.len() => Ok(Parsed { root, nodes: p.nodes, names: p.names }),
-        _ => Err(Failure::Invalid),
+
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<(), E> {
+        Ok(())
     }
-}
 
-fn hex(c: u8) -> Option<u32> {
-    char::from(c).to_digit(16)
-}
-
-/// Appends code point `c` as (modified) UTF-8: NUL becomes `C0 80`, surrogates are encoded like
-/// any other value.
-fn push_utf8(out: &mut Vec<u8>, c: u32) {
-    let byte = |v: u32| u8::try_from(v & 0xFF).unwrap_or(0);
-    match c {
-        0 => out.extend_from_slice(&[0xC0, 0x80]),
-        1..=0x7F => out.push(byte(c)),
-        0x80..=0x7FF => out.extend_from_slice(&[byte(0xC0 | (c >> 6)), byte(0x80 | (c & 0x3F))]),
-        0x800..=0xFFFF => out.extend_from_slice(&[
-            byte(0xE0 | (c >> 12)),
-            byte(0x80 | ((c >> 6) & 0x3F)),
-            byte(0x80 | (c & 0x3F)),
-        ]),
-        _ => out.extend_from_slice(&[
-            byte(0xF0 | (c >> 18)),
-            byte(0x80 | ((c >> 12) & 0x3F)),
-            byte(0x80 | ((c >> 6) & 0x3F)),
-            byte(0x80 | (c & 0x3F)),
-        ]),
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<(), E> {
+        Ok(())
     }
-}
 
-/// Four hex digits at `s[i..]`.
-fn hex4(s: &[u8], i: usize) -> Option<u32> {
-    let d = s.get(i..i.checked_add(4)?)?;
-    d.iter().try_fold(0u32, |acc, &c| Some((acc << 4) | hex(c)?))
-}
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
 
-/// Decodes a string body's escapes. Unknown escapes are kept verbatim (backslash included).
-fn unescape(body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len());
-    let mut i = 0usize;
-    while let Some(&c) = body.get(i) {
-        i = i.saturating_add(1);
-        if c != b'\\' {
-            out.push(c);
-            continue;
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(mut self, mut seq: A) -> Result<(), A::Error> {
+        let slot = self.open();
+        let mut n = 0u32;
+        while seq.next_element_seed(MeasureNode { m: self.0, name: index_digits(n) })?.is_some() {
+            n = n.saturating_add(1);
         }
-        let Some(&e) = body.get(i) else {
-            out.push(b'\\');
-            break;
-        };
-        i = i.saturating_add(1);
-        let plain = match e {
-            b'"' => Some(b'"'),
-            b'\\' => Some(b'\\'),
-            b'/' => Some(b'/'),
-            b'b' => Some(0x08),
-            b'f' => Some(0x0C),
-            b'n' => Some(b'\n'),
-            b'r' => Some(b'\r'),
-            b't' => Some(b'\t'),
-            _ => None,
-        };
-        if let Some(p) = plain {
-            out.push(p);
-            continue;
-        }
-        if e == b'u'
-            && let Some(mut code) = hex4(body, i)
-        {
-            i = i.saturating_add(4);
-            if (0xD800..0xDC00).contains(&code)
-                && body.get(i) == Some(&b'\\')
-                && body.get(i.saturating_add(1)) == Some(&b'u')
-                && let Some(low) = hex4(body, i.saturating_add(2))
-                && (0xDC00..0xE000).contains(&low)
-            {
-                i = i.saturating_add(6);
-                let high = code.wrapping_sub(0xD800).wrapping_shl(10);
-                code = 0x10000u32.wrapping_add(high).wrapping_add(low.wrapping_sub(0xDC00));
-            }
-            push_utf8(&mut out, code);
-            continue;
-        }
-        out.push(b'\\');
-        out.push(e);
+        self.close(slot, n);
+        Ok(())
     }
-    out
+
+    fn visit_map<A: MapAccess<'de>>(mut self, mut map: A) -> Result<(), A::Error> {
+        let slot = self.open();
+        let mut n = 0u32;
+        while let Some(key) = map.next_key_seed(KeyLen)? {
+            map.next_value_seed(MeasureNode { m: self.0, name: key })?;
+            n = n.saturating_add(1);
+        }
+        self.close(slot, n);
+        Ok(())
+    }
+}
+
+/// Measures `text` (see [`Measure`]).
+fn measure(text: &[u8], limit: usize) -> Result<Measure, Failure> {
+    let mut m = Measure { nodes: 0, names: 0, limit, counts: Vec::new(), too_large: false };
+    let mut d = serde_json::Deserializer::from_slice(text);
+    let parsed = MeasureNode { m: &mut m, name: 0 }.deserialize(&mut d).and_then(|()| d.end());
+    match parsed {
+        Ok(()) => Ok(m),
+        Err(_) if m.too_large => Err(Failure::TooLarge),
+        Err(_) => Err(Failure::Invalid),
+    }
 }
 
 // ---- layout -----------------------------------------------------------------------------------
 
-struct Layout<'a, H: Host> {
+/// Pass 2: writes the document into the block being built, in the layout [`Measure`] sized.
+struct Writer<'a, H: Host> {
     vm: &'a mut Vm<H>,
-    /// The document text the tree's spans refer to.
-    data: &'a [u8],
     /// The block being built; `base` is its VM address.
     out: Vec<u8>,
     base: u32,
     next_node: usize,
     next_name: usize,
+    /// Child counts of the objects and arrays, in pre-order (from [`Measure`]).
+    counts: std::vec::IntoIter<u32>,
+    /// A VM error (out of temp strings) that stopped the write.
+    failed: Option<VmError>,
 }
 
-impl<H: Host> Layout<'_, H> {
+impl<H: Host> Writer<'_, H> {
     fn addr(&self, offset: usize) -> u32 {
         u32::try_from(offset).ok().and_then(|o| self.base.checked_add(o)).unwrap_or(0)
     }
@@ -455,58 +281,144 @@ impl<H: Host> Layout<'_, H> {
         }
     }
 
-    fn node(&mut self, node: &Node, slot: usize) -> Result<(), VmError> {
-        let at = slot.saturating_mul(NODE);
-        let index;
-        let name = match node.name {
-            Name::Root => &[][..],
-            Name::Key(key) => key.of(self.data),
-            Name::Index(i) => {
-                index = i.to_string();
-                index.as_bytes()
-            }
-        };
-        if !name.is_empty() {
-            let name_at = self.next_name;
-            self.put(name_at, name);
-            self.next_name = name_at.saturating_add(name.len()).saturating_add(1);
-            let r = self.addr(name_at);
-            self.put(at.saturating_add(4), &r.to_le_bytes());
+    /// Stores a name in the names area; returns its address (null for an empty name).
+    fn name(&mut self, name: &[u8]) -> u32 {
+        if name.is_empty() {
+            return 0;
         }
-        let number = |v: f64| v.to_le_bytes();
-        let ty = match &node.kind {
-            Kind::Str(body) => {
-                let s = self.vm.temp(&unescape(body.of(self.data)))?;
-                self.put(at.saturating_add(8), &s.0.to_le_bytes());
-                TYPE_STRING
-            }
-            Kind::Num(text) => {
-                let text = text.of(self.data);
-                // FTE reads at most 63 characters.
-                let v = atof(text.get(..text.len().min(63)).unwrap_or_default());
-                self.put(at.saturating_add(8), &number(v));
-                TYPE_NUMBER
-            }
-            Kind::True => {
-                self.put(at.saturating_add(8), &number(1.0));
-                TYPE_TRUE
-            }
-            Kind::False => TYPE_FALSE,
-            Kind::Null => TYPE_NULL,
-            Kind::Object | Kind::Array => {
-                let first = self.next_node;
-                self.next_node = first.saturating_add(node.children.len());
-                let child_ptr = self.addr(first.saturating_mul(NODE));
-                let n = u32::try_from(node.children.len()).unwrap_or(u32::MAX);
-                self.put(at.saturating_add(8), &child_ptr.to_le_bytes());
-                self.put(at.saturating_add(12), &n.to_le_bytes());
-                for (k, child) in node.children.iter().enumerate() {
-                    self.node(child, first.saturating_add(k))?;
-                }
-                if matches!(node.kind, Kind::Object) { TYPE_OBJECT } else { TYPE_ARRAY }
-            }
-        };
+        let at = self.next_name;
+        self.put(at, name);
+        self.next_name = at.saturating_add(name.len()).saturating_add(1);
+        self.addr(at)
+    }
+
+    /// Writes node `slot`'s type and name, and the 8 bytes after them.
+    fn node(&mut self, slot: usize, ty: u32, name: u32, value: [u8; 8]) {
+        let at = slot.saturating_mul(NODE);
         self.put(at, &ty.to_le_bytes());
+        self.put(at.saturating_add(4), &name.to_le_bytes());
+        self.put(at.saturating_add(8), &value);
+    }
+
+    /// Reserves the child slots of a container: `(first slot, count)`.
+    fn children(&mut self) -> (usize, u32) {
+        let n = self.counts.next().unwrap_or(0);
+        let first = self.next_node;
+        self.next_node = first.saturating_add(usize_from(n));
+        (first, n)
+    }
+
+    fn container(&mut self, slot: usize, ty: u32, name: u32, first: usize, n: u32) {
+        let first = self.addr(first.saturating_mul(NODE));
+        self.node(slot, ty, name, words(first, n));
+    }
+}
+
+/// A key, stored in the names area; its value is the name's address.
+struct WriteKey<'w, 'a, H: Host>(&'w mut Writer<'a, H>);
+
+impl<'de, H: Host> DeserializeSeed<'de> for WriteKey<'_, '_, H> {
+    type Value = u32;
+
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<u32, D::Error> {
+        d.deserialize_str(self)
+    }
+}
+
+impl<H: Host> Visitor<'_> for WriteKey<'_, '_, H> {
+    type Value = u32;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a key")
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<u32, E> {
+        Ok(self.0.name(&qc_text(v)))
+    }
+}
+
+/// One node to write into `slot`, named by the name at address `name`.
+struct WriteNode<'w, 'a, H: Host> {
+    w: &'w mut Writer<'a, H>,
+    slot: usize,
+    name: u32,
+}
+
+impl<'de, H: Host> DeserializeSeed<'de> for WriteNode<'_, '_, H> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de, H: Host> Visitor<'de> for WriteNode<'_, '_, H> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<(), E> {
+        let (ty, value) = if v { (TYPE_TRUE, 1.0f64) } else { (TYPE_FALSE, 0.0) };
+        self.w.node(self.slot, ty, self.name, value.to_le_bytes());
+        Ok(())
+    }
+
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<(), E> {
+        self.visit_f64(v as f64)
+    }
+
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<(), E> {
+        self.visit_f64(v as f64)
+    }
+
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<(), E> {
+        self.w.node(self.slot, TYPE_NUMBER, self.name, v.to_le_bytes());
+        Ok(())
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<(), E> {
+        match self.w.vm.temp(&qc_text(v)) {
+            Ok(s) => {
+                self.w.node(self.slot, TYPE_STRING, self.name, words(s.0, 0));
+                Ok(())
+            }
+            Err(e) => {
+                self.w.failed = Some(e);
+                Err(E::custom("out of temp strings"))
+            }
+        }
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<(), E> {
+        self.w.node(self.slot, TYPE_NULL, self.name, [0; 8]);
+        Ok(())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        let (first, n) = self.w.children();
+        self.w.container(self.slot, TYPE_ARRAY, self.name, first, n);
+        for k in 0..n {
+            let name = self.w.name(k.to_string().as_bytes());
+            let slot = first.saturating_add(usize_from(k));
+            if seq.next_element_seed(WriteNode { w: self.w, slot, name })?.is_none() {
+                return Err(de::Error::custom("the document changed between passes"));
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let (first, n) = self.w.children();
+        self.w.container(self.slot, TYPE_OBJECT, self.name, first, n);
+        for k in 0..n {
+            let Some(name) = map.next_key_seed(WriteKey(self.w))? else {
+                return Err(de::Error::custom("the document changed between passes"));
+            };
+            let slot = first.saturating_add(usize_from(k));
+            map.next_value_seed(WriteNode { w: self.w, slot, name })?;
+        }
         Ok(())
     }
 }
@@ -561,12 +473,12 @@ fn node_arg<H: Host>(vm: &mut Vm<H>, i: usize) -> Result<NodeView, VmError> {
 /// `jsonnode json_parse(string json)`: parses a document into a new heap block and returns its
 /// root node, or null if the text is not valid (FTE-flavoured) JSON.
 pub fn json_parse<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
-    let text = vm.arg_str(0).to_vec();
-    // Validate and measure first, allocating nothing, so a document whose layout cannot fit the
-    // heap costs no memory; only then build the tree.
+    let arg = vm.arg_str(0).to_vec();
+    let text = arg.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&arg);
+    // Measure first, so a document whose tree cannot fit the heap costs no memory.
     let limit = usize_from(vm.core.config.limits.heap_bytes);
-    let parsed = match parse(&text, false, limit).and_then(|_| parse(&text, true, limit)) {
-        Ok(parsed) => parsed,
+    let m = match measure(text, limit) {
+        Ok(m) => m,
         Err(Failure::Invalid) => {
             vm.ret_raw([0; 3]);
             return Ok(());
@@ -576,8 +488,8 @@ pub fn json_parse<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError>
             return soft_error(vm, "json_parse: out of memory");
         }
     };
-    let Parsed { root, nodes, names } = parsed;
-    let size = nodes.saturating_mul(NODE).saturating_add(names);
+    let nodes_bytes = m.nodes.saturating_mul(NODE);
+    let size = nodes_bytes.saturating_add(m.names);
     let Some(base) = u32::try_from(size).ok().and_then(|n| heap_alloc(&mut vm.core, n)) else {
         vm.ret_raw([0; 3]);
         return soft_error(vm, "json_parse: out of memory");
@@ -589,14 +501,24 @@ pub fn json_parse<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError>
         return soft_error(vm, "json_parse: out of memory");
     }
     out.resize(size, 0);
-    let next_name = nodes.saturating_mul(NODE);
-    let mut layout = Layout { vm, data: &text, out, base, next_node: 1, next_name };
-    let laid_out = layout.node(&root, 0);
-    let Layout { vm, out, .. } = layout;
-    if let Err(e) = laid_out {
+    let mut w = Writer {
+        vm,
+        out,
+        base,
+        next_node: 1,
+        next_name: nodes_bytes,
+        counts: m.counts.into_iter(),
+        failed: None,
+    };
+    let mut d = serde_json::Deserializer::from_slice(text);
+    let written =
+        WriteNode { w: &mut w, slot: 0, name: 0 }.deserialize(&mut d).and_then(|()| d.end());
+    let Writer { vm, out, failed, .. } = w;
+    if written.is_err() {
         // Out of temp strings: do not leak the block.
         super::memory::heap_free(&mut vm.core, base);
-        return Err(e);
+        vm.ret_raw([0; 3]);
+        return failed.map_or(Ok(()), Err);
     }
     vm.write_mem(crate::value::Ptr(base), &out);
     vm.ret_raw([base, 0, 0]);
@@ -715,51 +637,43 @@ mod tests {
         assert_eq!(atoi(b"99999999999999999999"), -1);
     }
 
-    #[test]
-    fn escapes() {
-        assert_eq!(unescape(br#"a\"b\\c\/d\n\t"#), b"a\"b\\c/d\n\t");
-        assert_eq!(unescape(b"\x5cu00e9"), "\u{e9}".as_bytes());
-        assert_eq!(unescape(b"\x5cud83d\x5cude00"), "\u{1F600}".as_bytes());
-        assert_eq!(unescape(br"\u0000"), [0xC0, 0x80]);
-        assert_eq!(unescape(br"\q\uZZ"), br"\q\uZZ");
-        assert_eq!(unescape(b"end\\"), b"end\\");
-    }
-
-    fn valid(data: &[u8]) -> bool {
-        let checked = parse(data, false, usize::MAX).is_ok();
-        assert_eq!(parse(data, true, usize::MAX).is_ok(), checked);
-        checked
+    fn valid(text: &str) -> bool {
+        measure(text.as_bytes(), usize::MAX).is_ok()
     }
 
     #[test]
-    fn grammar() {
-        assert!(!valid(b""));
-        assert!(valid(b"{}"));
-        assert!(valid(b"[1,]"));
-        assert!(valid(b"{\"a\":1,}"));
-        assert!(!valid(b"[1 2]"));
-        assert!(!valid(b"{} x"));
-        assert!(valid(b"\xEF\xBB\xBF // hi\n /* c */ [true, NULL, False]"));
-        assert!(!valid(b"\"unterminated"));
-        let deep = [b'['; 1000];
-        assert!(!valid(&deep));
+    fn strict_grammar() {
+        assert!(valid("{}"));
+        assert!(valid(" [1, \"two\", {\"k\": null}] "));
+        assert!(valid("42"));
+        for text in ["", "[1,]", "{\"a\":1,}", "[1 2]", "{} x", "// c\n[]", "[abc]", "[TRUE]"] {
+            assert!(!valid(text), "{text:?}");
+        }
+        assert!(!valid(&("[".repeat(200) + &"]".repeat(200))), "nesting is bounded");
     }
 
-    /// The layout size is known without building anything, and exceeding the limit stops the
-    /// parse early.
+    /// The layout size and the containers' child counts are known without building anything,
+    /// and exceeding the limit stops the parse early.
     #[test]
     fn layout_size_and_limit() {
-        let doc = br#"{"ab": [1, "x"], "": null}"#;
-        let p = parse(doc, false, usize::MAX).unwrap();
-        assert!(p.root.children.is_empty(), "nothing is built when measuring");
-        // Root, "ab", its two elements and the empty-named null: 5 nodes; names "ab", "0", "1".
-        assert_eq!((p.nodes, p.names), (5, 3 + 2 + 2));
-        let built = parse(doc, true, usize::MAX).unwrap();
-        assert_eq!(built.root.children.len(), 2);
-        let size = 5 * NODE + 7;
-        assert!(parse(doc, false, size).is_ok());
-        assert_eq!(parse(doc, false, size - 1).unwrap_err(), Failure::TooLarge);
-        let wide = format!("[{}]", "0,".repeat(100_000));
-        assert_eq!(parse(wide.as_bytes(), true, 64 * 1024).unwrap_err(), Failure::TooLarge);
+        let doc = br#"{"ab": [1, "x"], "": null, "n\u0000": {}}"#;
+        let m = measure(doc, usize::MAX).unwrap();
+        // Root, "ab", its two elements, the empty-named null and "n\0": 6 nodes; names "ab",
+        // "0", "1" and "n" + C0 80 (the NUL of each counted).
+        assert_eq!((m.nodes, m.names), (6, 3 + 2 + 2 + 4));
+        assert_eq!(m.counts, [3, 2, 0], "pre-order: root, ab, n");
+        let size = 6 * NODE + 11;
+        assert!(measure(doc, size).is_ok());
+        assert_eq!(measure(doc, size - 1).unwrap_err(), Failure::TooLarge);
+        let wide = format!("[{}0]", "0,".repeat(100_000));
+        assert_eq!(measure(wide.as_bytes(), 64 * 1024).unwrap_err(), Failure::TooLarge);
+    }
+
+    #[test]
+    fn nul_is_stored_overlong() {
+        assert_eq!(qc_text("a\0b"), &b"a\xC0\x80b"[..]);
+        assert_eq!(qc_len("a\0b"), 4);
+        assert_eq!(index_digits(0), 1);
+        assert_eq!(index_digits(10), 2);
     }
 }

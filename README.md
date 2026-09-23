@@ -64,6 +64,13 @@ The design lives in [docs/design.md](docs/design.md); the behaviour it implement
 [docs/spec](docs/spec), including a list of [deliberate deviations](docs/spec/deviations.md) from
 FTE.
 
+## Cargo features
+
+| Feature | Default | Enables |
+|---|---|---|
+| `digests` | yes | MD4, MD5, SHA-1 and SHA-2 for `digest_hex`/`digest_ptr` (RustCrypto crates) |
+| `json` | yes | the `json_*` builtins (strict JSON, parsed with `serde_json`) |
+
 ## Testing
 
 `cargo test` runs the self-contained suite. Some tests need external tools and are skipped (with a

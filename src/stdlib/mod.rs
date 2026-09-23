@@ -15,6 +15,7 @@ pub mod format;
 pub mod hash;
 pub mod hostcalls;
 pub mod introspect;
+#[cfg(feature = "json")]
 pub mod json;
 pub mod math;
 pub mod memory;
@@ -52,6 +53,7 @@ pub(crate) fn register_all<H: Host>(b: &mut Builtins<H>) {
     hash::register(b);
     hostcalls::register(b);
     introspect::register(b);
+    #[cfg(feature = "json")]
     json::register(b);
     math::register(b);
     memory::register(b);

@@ -13,14 +13,18 @@ categories = ["game-development"]
 exclude = ["/scripts", "/tests/qc"]
 
 [features]
-default = ["digests"]
+default = ["digests", "json"]
 # MD4/MD5/SHA1/SHA2 support for the `digest_hex`/`digest_ptr` builtins (CRC16 is always available).
 digests = ["dep:md4", "dep:md-5", "dep:sha1", "dep:sha2"]
+# The `json_*` builtins (parsing with serde_json).
+json = ["dep:serde", "dep:serde_json"]
 
 [dependencies]
 libm = "0.2.16"
 md-5 = { version = "0.11.0", optional = true }
 md4 = { version = "0.11.0", optional = true }
+serde = { version = "1.0.229", default-features = false, features = ["std"], optional = true }
+serde_json = { version = "1.0.151", default-features = false, features = ["std"], optional = true }
 sha1 = { version = "0.11.0", optional = true }
 sha2 = { version = "0.11.0", optional = true }
 
