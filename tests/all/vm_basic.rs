@@ -588,3 +588,35 @@ fn reentrancy_limit() {
     assert!(vm.call(&mut host, func(&vm, "recurse"), &[Arg::Float(0.0)]).is_err());
     assert!(vm.backtrace().0.is_empty());
 }
+
+fn b_abort(vm: &mut Vm<TestHost>, _host: &mut TestHost) -> Result<(), VmError> {
+    let v = vm.arg_f32(0);
+    Err(VmError::abort([v.to_bits(), 0, 0]))
+}
+
+#[test]
+fn abort_unwinds_to_the_engine_boundary() {
+    let mut asm = Asm::new();
+    let ab = asm.builtin("abort", 211, 1);
+    let ab_g = asm.global("ab_g", ty::FUNCTION, &[ab]);
+    let (forty2, seven) = (asm.float(42.0), asm.float(7.0));
+    let inner = asm.function("inner", &[], 1);
+    asm.emit(Op::StoreF, seven, inner.local(0), 0);
+    asm.emit(Op::StoreF, forty2, parm(0), 0);
+    asm.emit(Op::Call1, ab_g, 0, 0);
+    asm.emit(Op::Return, seven, 0, 0);
+    let inner_g = asm.global("inner_g", ty::FUNCTION, &[inner.index]);
+    let outer = asm.function("outer", &[], 0);
+    asm.emit(Op::Call0, inner_g, 0, 0);
+    asm.emit(Op::Return, seven, 0, 0);
+    let _ = outer;
+    let mut b = Builtins::empty(Numbering::None);
+    b.set_numbered(211, "abort", b_abort);
+    let mut vm = vm_with(&asm, b);
+    let mut host = TestHost::default();
+    let r = vm.call(&mut host, func(&vm, "outer"), &[]).unwrap();
+    assert_eq!(r.f32(), 42.0);
+    assert!(vm.backtrace().0.is_empty());
+    // The inner function's local was restored by the unwind.
+    assert_eq!(vm.call(&mut host, func(&vm, "outer"), &[]).unwrap().f32(), 42.0);
+}

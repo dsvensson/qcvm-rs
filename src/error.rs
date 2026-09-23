@@ -179,13 +179,21 @@ pub struct VmError(Box<Inner>);
 struct Inner {
     kind: ErrorKind,
     backtrace: Backtrace,
+    control: Option<Control>,
+}
+
+/// Non-error unwinding requested by a builtin, carried through the error path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Control {
+    /// `abort(ret)`: unwind to the nearest engine boundary and return `ret` from there.
+    Abort([u32; 3]),
 }
 
 impl VmError {
     /// Creates an error without a backtrace (the VM adds one when it propagates out of QuakeC).
     #[must_use]
     pub fn new(kind: ErrorKind) -> Self {
-        Self(Box::new(Inner { kind, backtrace: Backtrace::default() }))
+        Self(Box::new(Inner { kind, backtrace: Backtrace::default(), control: None }))
     }
 
     /// A builtin failure with a message.
@@ -210,6 +218,19 @@ impl VmError {
     #[must_use]
     pub fn backtrace(&self) -> &Backtrace {
         &self.0.backtrace
+    }
+
+    /// Unwinds QuakeC to the nearest engine boundary, which then returns `ret` normally (the
+    /// `abort` builtin).
+    #[must_use]
+    pub fn abort(ret: [u32; 3]) -> Self {
+        let mut e = Self::new(ErrorKind::Builtin("abort".into()));
+        e.0.control = Some(Control::Abort(ret));
+        e
+    }
+
+    pub(crate) fn control(&self) -> Option<Control> {
+        self.0.control
     }
 
     pub(crate) fn with_backtrace(mut self, backtrace: Backtrace) -> Self {

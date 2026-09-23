@@ -197,6 +197,8 @@ pub(crate) struct Core {
     pub(crate) remove_clears: Vec<u32>,
     /// State of the standard builtins (tokens, hash tables, string buffers).
     pub(crate) std: crate::stdlib::StdState,
+    /// The value `abort(ret)` returns from the engine boundary it unwound to.
+    pub(crate) abort_ret: Option<[u32; 3]>,
 }
 
 impl Core {

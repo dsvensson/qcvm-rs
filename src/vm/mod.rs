@@ -52,6 +52,13 @@ impl fmt::Display for LookupError {
 
 impl std::error::Error for LookupError {}
 
+/// Whether execution continues after a builtin returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Return,
+}
+
 /// A QuakeC builtin that the VM could not bind (reported by [`Vm::unbound_builtins`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnboundBuiltin {
@@ -308,7 +315,7 @@ impl<H: Host> Vm<H> {
             Some(Callee::Builtin(slot)) => {
                 let saved_prnum = self.core.x.prnum;
                 self.core.x.prnum = pr;
-                let r = self.run_builtin(host, slot, f, self.core.frames.len());
+                let r = self.run_builtin(host, slot, f, self.core.frames.len()).map(|_| ());
                 self.core.x.prnum = saved_prnum;
                 r
             }
@@ -321,7 +328,7 @@ impl<H: Host> Vm<H> {
 
         self.core.nesting = self.core.nesting.saturating_sub(1);
         (self.core.argc, self.core.builtin) = saved;
-        let ret = self.read_return(pr);
+        let ret = self.core.abort_ret.take().unwrap_or_else(|| self.read_return(pr));
         if top_level {
             if self.core.suppressed > 0 {
                 let n = self.core.suppressed;
@@ -435,7 +442,9 @@ impl<H: Host> Vm<H> {
                 }
                 Exit::Builtin { slot, func } => {
                     self.flush_warnings(host);
-                    self.run_builtin(host, slot, func, exit_depth)?;
+                    if self.run_builtin(host, slot, func, exit_depth)? == Flow::Return {
+                        return Ok(());
+                    }
                 }
                 Exit::StateOp(op) => {
                     let handled = match host.state_op(self, op) {
@@ -461,20 +470,28 @@ impl<H: Host> Vm<H> {
         slot: u32,
         func: FuncRef,
         exit_depth: usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<Flow, VmError> {
         let Some(f) = self.builtins.func(slot) else {
             return Err(self.fail(missing(&self.core, func).into(), exit_depth));
         };
         self.core.builtin = func;
         match f(self, host) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(Flow::Continue),
+            Err(e) if matches!(e.control(), Some(crate::error::Control::Abort(_))) => {
+                // `abort(ret)`: unwind to this engine boundary and return normally from it.
+                if let Some(crate::error::Control::Abort(ret)) = e.control() {
+                    self.core.abort_ret = Some(ret);
+                }
+                self.core.unwind(exit_depth);
+                Ok(Flow::Return)
+            }
             Err(e) if self.core.config.developer && matches!(e.kind(), ErrorKind::Builtin(_)) => {
                 // FTE's developer mode: a builtin error is only a warning, with a zero result.
                 let msg = e.kind().to_string();
                 self.core.warn(WarningKind::Builtin(msg));
                 self.ret_raw([0; 3]);
                 self.flush_warnings(host);
-                Ok(())
+                Ok(Flow::Continue)
             }
             Err(e) => Err(self.fail(e, exit_depth)),
         }
@@ -1082,6 +1099,7 @@ fn build_core<H: Host>(
         trace: false,
         remove_clears,
         std: crate::stdlib::StdState::default(),
+        abort_ret: None,
         config,
     })
 }
