@@ -12,6 +12,11 @@ keywords = ["quake", "quakec", "csqc", "vm", "interpreter"]
 categories = ["game-development"]
 exclude = ["/scripts", "/tests/qc"]
 
+[workspace]
+# Examples with heavy dependencies live in crates of their own, built only on request (`-p`).
+members = ["examples/menuqc"]
+default-members = ["."]
+
 [features]
 default = ["digests", "json"]
 # MD4/MD5/SHA1/SHA2 support for the `digest_hex`/`digest_ptr` builtins (CRC16 is always available).

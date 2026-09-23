@@ -7,3 +7,5 @@
 *.lno
 !tests/qc/**/*.qc
 /.claude/
+*.pk3
+*.pak

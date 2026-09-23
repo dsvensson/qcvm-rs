@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "menuqc"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Runs QCQuake (Quake compiled to menu QuakeC) on qcvm in a winit window"
+publish = false
+
+[dependencies]
+cpal = "0.18.2"
+qcvm = { path = "../.." }
+softbuffer = "0.4.8"
+winit = "0.30.13"
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[lints.rust]
+unsafe_code = "forbid"
