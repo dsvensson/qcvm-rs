@@ -80,11 +80,12 @@ notice) when those are missing:
 |---|---|
 | `FTEQCC` | QuakeC compiler for the `.qc` fixtures, when neither `fteqcc64` nor `fteqcc` is on `PATH` |
 | `FTE_QCVM` | FTE's standalone `qcvm` runner, used as a black-box oracle for differential tests |
-| `QCVM_CSPROGS` | path to a KTX `csprogs.dat` for the CSQC integration test |
+| `QCVM_CSPROGS` | path to a KTX `csprogs.dat` for the CSQC integration test and benchmark |
 | `QCVM_FUZZ_CASES` | number of random programs the execution fuzz test runs (default 256) |
 
-`cargo bench` runs the interpreter benchmarks. The interpreter is much slower unoptimised; a
-project depending on qcvm can keep it fast in debug builds with
+`cargo bench` runs the interpreter benchmarks, and `scripts/bench-fte.ps1` times qcvm against
+FTE's runner. The interpreter is much slower unoptimised; a project depending on qcvm can keep it
+fast in debug builds with
 
 ```toml
 [profile.dev.package.qcvm]

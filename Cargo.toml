@@ -40,6 +40,10 @@ path = "tests/all/main.rs"
 name = "vm"
 harness = false
 
+[[bench]]
+name = "csprogs"
+harness = false
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

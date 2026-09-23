@@ -3,6 +3,7 @@
 //! Shared helpers for the integration tests.
 
 pub mod asm;
+pub mod csqc_engine;
 pub mod harness;
 pub mod qcc;
 pub mod runner;

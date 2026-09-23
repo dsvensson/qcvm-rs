@@ -8,12 +8,15 @@
 //! suspend threads. Running them may fail in any way the VM reports, but must not panic. The
 //! standard builtins get the same treatment: random call sequences with hostile arguments. Set
 //! `QCVM_FUZZ_CASES` for a longer run.
+//!
+//! Programs rich in compare-and-branch pairs also check that the interpreter behaves exactly like
+//! its tracing instance, and that stopping for the budget and resuming loses nothing.
 
 use std::sync::Arc;
 
 use proptest::prelude::*;
 use qcvm::{
-    Arg, Builtins, FuncRef, Limits, Numbering, Op, Program, ProgsFormat, Vm, VmConfig, VmError,
+    Arg, Builtins, FuncRef, Limits, Numbering, Op, Program, ProgsFormat, Ptr, Vm, VmConfig, VmError,
 };
 
 use crate::support::asm::{Asm, ty};
@@ -149,6 +152,109 @@ proptest! {
         }
         let _ = vm.collect_garbage();
         vm.reset().unwrap();
+    }
+}
+
+// ---- the interpreter against its tracing instance ------------------------------------------------
+
+/// A compare-and-branch pair as fteqcc emits them: a statement that writes a truth value to `c`,
+/// then `IF`/`IFNOT` on `c` with a short jump.
+fn pair() -> impl Strategy<Value = Stmts> {
+    let test = prop::sample::select(vec![
+        Op::LtF,
+        Op::LeF,
+        Op::GtF,
+        Op::GeF,
+        Op::EqF,
+        Op::NeF,
+        Op::EqI,
+        Op::LtI,
+        Op::GeI,
+        Op::LtIF,
+        Op::GeFI,
+        Op::EqE,
+        Op::NeFnc,
+        Op::NotF,
+        Op::NotEnt,
+        Op::NotFnc,
+        Op::NotI,
+        Op::AndF,
+        Op::OrF,
+        Op::BitAndF,
+    ]);
+    let branch = prop::sample::select(vec![Op::IfI, Op::IfNotI, Op::IfF, Op::IfNotF]);
+    (test, 0u32..96, 0u32..96, 0u32..96, branch, -8i32..8).prop_map(|(op, a, b, c, br, off)| {
+        vec![(op as u32, a, b, c), (br as u32, c, off as u32, 0)]
+    })
+}
+
+/// A function of random statements and compare-and-branch pairs; random jumps land in the middle
+/// of pairs too.
+fn branchy_function() -> impl Strategy<Value = Stmts> {
+    let single = (opcode(), operand(), operand(), operand()).prop_map(|st| vec![st]);
+    prop::collection::vec(prop_oneof![single, pair()], 1..24).prop_map(|parts| parts.concat())
+}
+
+/// Runs every function of `program` and records what happened: results (errors with their
+/// backtraces), warnings, and the memory from the strings through the globals into the local
+/// stack.
+fn outcome(program: &Arc<Program>, funcs: usize, arg: u32, trace: bool, limits: Limits) -> String {
+    let mut b = Builtins::standard(Numbering::Csqc);
+    b.set_numbered(1, "spawn", b_spawn);
+    b.set_numbered(2, "temp", b_temp);
+    b.set_numbered(3, "call", b_call);
+    b.set_numbered(4, "gc", b_gc);
+    let config = VmConfig { limits, ..VmConfig::csqc() };
+    let mut vm = Vm::new(Arc::clone(program), Arc::new(b), config).unwrap();
+    vm.set_trace(trace);
+    let mut host = TestHost::default();
+    let _ = vm.spawn();
+    let mut log = String::new();
+    for i in 0..funcs {
+        let f = vm.find_function(format!("f{i}")).unwrap_or(FuncRef::NULL);
+        let r = vm.call(&mut host, f, &[Arg::Raw([arg, 0, 0]), Arg::Vector([1.0, 2.0, 3.0])]);
+        log.push_str(&format!("{r:?}\n"));
+        let r = vm.run_threads(&mut host);
+        log.push_str(&format!("{r:?}\n"));
+    }
+    log.push_str(&format!("{:?}\n", host.warnings));
+    let end = vm.global::<qcvm::EntRef>("self").unwrap().ptr().0 + 4096;
+    log.push_str(&format!("{:?}\n", vm.read_mem(Ptr(0), end as usize)));
+    log
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(cases()))]
+
+    #[test]
+    fn interpreter_matches_its_tracing_instance(
+        funcs in prop::collection::vec(branchy_function(), 1..4),
+        words in prop::collection::vec(word(), 8..40),
+        wide in any::<bool>(),
+        arg in word(),
+    ) {
+        let format = if wide { ProgsFormat::Fte32 } else { ProgsFormat::Fte16 };
+        let Ok(program) = Program::parse(&build(&funcs, &words, format)) else {
+            return Ok(());
+        };
+        let program = Arc::new(program);
+        let limits = Limits {
+            runaway: 3_000,
+            call_depth: 64,
+            local_stack_words: 4096,
+            reentry: 8,
+            ..Limits::default()
+        };
+        let fast = outcome(&program, funcs.len(), arg, false, limits.clone());
+        let traced = outcome(&program, funcs.len(), arg, true, limits.clone());
+        prop_assert_eq!(fast, traced);
+
+        // A budget big enough to be handed out in chunks stops the interpreter mid-run; the
+        // outcome must not change.
+        let long = Limits { runaway: 200_000, ..limits };
+        let whole = outcome(&program, funcs.len(), arg, false, long.clone());
+        let chunked = Limits { deadline: Some(std::time::Duration::from_secs(3600)), ..long };
+        prop_assert_eq!(whole, outcome(&program, funcs.len(), arg, false, chunked));
     }
 }
 

@@ -28,9 +28,7 @@ impl Host for BenchHost {}
 
 fn vm(asm: &Asm, builtins: Builtins<BenchHost>) -> Vm<BenchHost> {
     let program = Arc::new(Program::parse(&asm.build(ProgsFormat::Fte16)).unwrap());
-    let mut config = VmConfig::default();
-    config.limits.local_stack_words = 1 << 16;
-    Vm::new(program, Arc::new(builtins), config).unwrap()
+    Vm::new(program, Arc::new(builtins), VmConfig::default()).unwrap()
 }
 
 /// `for (i = 0; i < n; i++) total += i * 0.5;`
@@ -54,31 +52,42 @@ fn float_loop() -> Asm {
     asm
 }
 
-/// Recursive Fibonacci.
+/// Recursive Fibonacci, as fteqcc compiles it (Hexen 2 style calls).
 fn fib() -> Asm {
     let mut asm = Asm::new();
     let (one, two) = (asm.float(1.0), asm.float(2.0));
     let fib_g = asm.global("fib_g", ty::FUNCTION, &[0]);
     let f = asm.function("main", &[1], 2);
-    let (n, t) = (f.local(0), f.local(1));
+    let (n, saved, t) = (f.local(0), f.local(1), f.local(2));
     asm.emit(Op::LtF, n, two, t);
     let br = asm.emit(Op::IfNotI, t, 0, 0);
     asm.emit(Op::Return, n, 0, 0);
     let rec = asm.here();
     asm.patch_jump(br, 1, rec);
-    asm.emit(Op::SubF, n, one, parm(0));
-    asm.emit(Op::Call1, fib_g, 0, 0);
-    asm.emit(Op::StoreF, OFS_RETURN, f.local(2), 0);
-    asm.emit(Op::SubF, n, two, parm(0));
-    asm.emit(Op::Call1, fib_g, 0, 0);
-    asm.emit(Op::AddF, f.local(2), OFS_RETURN, t);
+    asm.emit(Op::SubF, n, one, t);
+    asm.emit(Op::Call1H, fib_g, t, 0);
+    asm.emit(Op::SubF, n, two, t);
+    asm.emit(Op::StoreF, OFS_RETURN, saved, 0);
+    asm.emit(Op::Call1H, fib_g, t, 0);
+    asm.emit(Op::AddF, saved, OFS_RETURN, t);
     asm.emit(Op::Return, t, 0, 0);
     asm.set_global(fib_g, f.index);
     asm
 }
 
-/// Reads and writes entity fields in a loop: `e.health = e.health + e.armor` via ADDRESS/STOREP.
-fn fields() -> Asm {
+/// How an entity-field loop writes `e.health`.
+#[derive(Clone, Copy)]
+enum FieldStore {
+    /// `e.health = e.health + e.armor`: LOAD_F, LOAD_F, ADD_F, STOREF_F (what fteqcc emits).
+    Direct,
+    /// The same through ADDRESS and STOREP_F.
+    Pointer,
+    /// `e.health += e.armor`: LOAD_F, ADDRESS, ADDSTOREP_F.
+    Compound,
+}
+
+/// Updates an entity field in a loop.
+fn fields(store: FieldStore) -> Asm {
     let mut asm = Asm::new();
     let (_, health) = asm.field("health", ty::FLOAT);
     let (_, armor) = asm.field("armor", ty::FLOAT);
@@ -89,11 +98,26 @@ fn fields() -> Asm {
     let top = asm.here();
     asm.emit(Op::LtF, i, n, t);
     let exit = asm.emit(Op::IfNotI, t, 0, 0);
-    asm.emit(Op::LoadF, e, health, t);
-    asm.emit(Op::LoadF, e, armor, f.local(5));
-    asm.emit(Op::AddF, t, f.local(5), t);
-    asm.emit(Op::Address, e, health, p);
-    asm.emit(Op::StorePF, t, p, 0);
+    match store {
+        FieldStore::Direct => {
+            asm.emit(Op::LoadF, e, health, t);
+            asm.emit(Op::LoadF, e, armor, p);
+            asm.emit(Op::AddF, t, p, t);
+            asm.emit(Op::StoreFieldF, e, health, t);
+        }
+        FieldStore::Pointer => {
+            asm.emit(Op::LoadF, e, health, t);
+            asm.emit(Op::LoadF, e, armor, p);
+            asm.emit(Op::AddF, t, p, t);
+            asm.emit(Op::Address, e, health, p);
+            asm.emit(Op::StorePF, t, p, 0);
+        }
+        FieldStore::Compound => {
+            asm.emit(Op::LoadF, e, armor, t);
+            asm.emit(Op::Address, e, health, p);
+            asm.emit(Op::AddStorePF, t, p, t);
+        }
+    }
     asm.emit(Op::AddF, i, one, i);
     let back = asm.emit(Op::Goto, 0, 0, 0);
     asm.patch_jump(back, 0, top);
@@ -186,17 +210,42 @@ fn run(c: &mut Criterion, name: &str, asm: &Asm, builtins: Builtins<BenchHost>, 
     c.bench_function(name, |b| b.iter(|| black_box(vm.call(&mut host, main, args).unwrap())));
 }
 
+/// Checks that the assembled programs compute what they should, so a benchmark never times a
+/// broken program.
+fn sanity() {
+    let none = || Builtins::empty(Numbering::None);
+    let mut host = BenchHost;
+    let mut fib_vm = vm(&fib(), none());
+    let main = fib_vm.find_function("main").unwrap();
+    assert_eq!(fib_vm.call(&mut host, main, &[Arg::Float(20.0)]).unwrap().f32(), 6765.0);
+    for store in [FieldStore::Direct, FieldStore::Pointer, FieldStore::Compound] {
+        let mut vm = vm(&fields(store), none());
+        let e = vm.spawn().unwrap();
+        let armor = vm.field::<f32>("armor").unwrap();
+        vm.set_field(e, armor, 2.0);
+        let main = vm.find_function("main").unwrap();
+        vm.call(&mut host, main, &[Arg::Ent(e), Arg::Float(10.0)]).unwrap();
+        let health = vm.field::<f32>("health").unwrap();
+        assert_eq!(vm.get_field(e, health), Some(20.0));
+    }
+}
+
 fn benches(c: &mut Criterion) {
+    sanity();
     let none = || Builtins::empty(Numbering::None);
     run(c, "float_loop_10k", &float_loop(), none(), &[Arg::Float(10_000.0)]);
     run(c, "fib_20", &fib(), none(), &[Arg::Float(20.0)]);
-    {
-        let asm = fields();
+    for (name, store) in [
+        ("fields_10k", FieldStore::Direct),
+        ("fields_ptr_10k", FieldStore::Pointer),
+        ("fields_add_10k", FieldStore::Compound),
+    ] {
+        let asm = fields(store);
         let mut vm = vm(&asm, none());
         let e = vm.spawn().unwrap();
         let mut host = BenchHost;
         let main = vm.find_function("main").unwrap();
-        c.bench_function("fields_10k", |b| {
+        c.bench_function(name, |b| {
             b.iter(|| {
                 black_box(vm.call(&mut host, main, &[Arg::Ent(e), Arg::Float(10_000.0)]).unwrap())
             })
