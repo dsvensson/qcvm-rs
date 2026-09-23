@@ -2,4 +2,5 @@
 
 //! Shared helpers for the integration tests.
 
+pub mod asm;
 pub mod tools;

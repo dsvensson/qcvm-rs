@@ -14,13 +14,10 @@ use std::path::{Path, PathBuf};
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     env::split_paths(&path).find_map(|dir| {
-        [
-            name.to_owned(),
-            format!("{name}{}", env::consts::EXE_SUFFIX),
-        ]
-        .into_iter()
-        .map(|file| dir.join(file))
-        .find(|candidate| candidate.is_file())
+        [name.to_owned(), format!("{name}{}", env::consts::EXE_SUFFIX)]
+            .into_iter()
+            .map(|file| dir.join(file))
+            .find(|candidate| candidate.is_file())
     })
 }
 
@@ -33,9 +30,7 @@ fn file_from_env(var: &str) -> Option<PathBuf> {
 
 /// The QuakeC compiler: `fteqcc64`/`fteqcc` on `PATH`, else `$FTEQCC`.
 pub fn fteqcc() -> Option<PathBuf> {
-    find_on_path("fteqcc64")
-        .or_else(|| find_on_path("fteqcc"))
-        .or_else(|| file_from_env("FTEQCC"))
+    find_on_path("fteqcc64").or_else(|| find_on_path("fteqcc")).or_else(|| file_from_env("FTEQCC"))
 }
 
 /// FTE's standalone `qcvm` runner (`$FTE_QCVM`), used as a black-box oracle.

@@ -23,6 +23,7 @@ fn needs_header(path: &Path) -> bool {
         return false;
     }
     name == ".gitignore"
+        || name == ".gitattributes"
         || path
             .extension()
             .and_then(|e| e.to_str())
@@ -41,12 +42,7 @@ fn walk(dir: &Path, missing: &mut Vec<String>) {
             let text = fs::read_to_string(&path).unwrap_or_default();
             let head: String = text.lines().take(3).collect::<Vec<_>>().join("\n");
             if !head.contains(SPDX) {
-                missing.push(
-                    path.strip_prefix(repo_root())
-                        .unwrap()
-                        .display()
-                        .to_string(),
-                );
+                missing.push(path.strip_prefix(repo_root()).unwrap().display().to_string());
             }
         }
     }
@@ -57,9 +53,5 @@ fn every_file_has_an_spdx_header() {
     let mut missing = Vec::new();
     walk(repo_root(), &mut missing);
     missing.sort();
-    assert!(
-        missing.is_empty(),
-        "files without `{SPDX}`:\n  {}",
-        missing.join("\n  ")
-    );
+    assert!(missing.is_empty(), "files without `{SPDX}`:\n  {}", missing.join("\n  "));
 }

@@ -16,3 +16,4 @@
 mod support;
 
 mod license;
+mod loader;

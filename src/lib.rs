@@ -10,3 +10,10 @@
 //! behaviour being implemented.
 
 #![forbid(unsafe_code)]
+
+mod bytes;
+pub mod opcode;
+pub mod progs;
+
+pub use opcode::Op;
+pub use progs::{LoadError, LoadNote, Program, ProgsFormat};
