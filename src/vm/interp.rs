@@ -17,7 +17,7 @@ use crate::error::{ErrorKind, WarningKind};
 use crate::opcode::Op;
 use crate::value::{EntRef, FuncRef, PrNum};
 use crate::vm::core::{Callee, Core, OFS_PARM0, OFS_PARM1, OFS_RETURN, SwitchKind};
-use crate::vm::memory::WriteError;
+use crate::vm::memory::{EntSlot, WriteError};
 use crate::vm::num::{d2i64, d2u64, f2i, f2u, fbool, float_true, ibool, join64, split64};
 use crate::vm::strings::{INDEX_MASK, StrKind, TAG_MASK, TEMP_TAG, classify, until_nul};
 
@@ -158,6 +158,17 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
             let (oa, ob, oc) = (usize_from(st.a), usize_from(st.b), usize_from(st.c));
             let s = core.mem.s.as_mut_slice();
 
+            // The parts of `Memory` that map a pointer to region S or E, borrowed apart from both.
+            macro_rules! pointer_map {
+                () => {
+                    PointerMap {
+                        e_base: core.mem.e_base,
+                        shift: core.mem.stride_shift,
+                        field_bytes: core.mem.field_bytes,
+                        slots: &core.mem.slots,
+                    }
+                };
+            }
             macro_rules! f3 {
                 ($op:tt) => {{
                     let v = gf(s, oa) $op gf(s, ob);
@@ -400,22 +411,24 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                 | Op::LoadI
                 | Op::LoadP => {
                     let (e, f) = (g(s, oa), g(s, ob));
-                    let v = match core.mem.field_offset(e, f, 1) {
-                        Some(o) => core.mem.ent_word(o),
-                        None => {
-                            core.x.pc = pc;
-                            bad_field_access(core, e, f);
-                            0
-                        }
-                    };
-                    core.mem.set_g(oc, v);
+                    let (ents, shift, fb) =
+                        (&core.mem.e, core.mem.stride_shift, core.mem.field_bytes);
+                    if let Some(w) = ent_field::<4>(ents, shift, fb, e, f) {
+                        set(s, oc, u32::from_le_bytes(*w));
+                    } else {
+                        core.x.pc = pc;
+                        bad_field_access(core, e, f);
+                        core.mem.set_g(oc, 0);
+                    }
                 }
                 Op::LoadV => {
                     let (e, f) = (g(s, oa), g(s, ob));
-                    if let Some(o) = core.mem.field_offset(e, f, 3) {
-                        let v = [0usize, 4, 8].map(|k| core.mem.ent_word(o.wrapping_add(k)));
-                        for (k, w) in [0usize, 4, 8].into_iter().zip(v) {
-                            core.mem.set_g(oc.wrapping_add(k), w);
+                    let (ents, shift, fb) =
+                        (&core.mem.e, core.mem.stride_shift, core.mem.field_bytes);
+                    if let Some(w) = ent_field::<12>(ents, shift, fb, e, f) {
+                        for (k, chunk) in w.chunks_exact(4).enumerate() {
+                            let v = chunk.first_chunk::<4>().map_or(0, |c| u32::from_le_bytes(*c));
+                            set(s, oc.wrapping_add(k.wrapping_mul(4)), v);
                         }
                     } else {
                         let entity_ok = e < core.mem.num_edicts();
@@ -431,10 +444,10 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                 }
                 Op::LoadI64 => {
                     let (e, f) = (g(s, oa), g(s, ob));
-                    if let Some(o) = core.mem.field_offset(e, f, 2) {
-                        let (lo, hi) = (core.mem.ent_word(o), core.mem.ent_word(o.wrapping_add(4)));
-                        core.mem.set_g(oc, lo);
-                        core.mem.set_g(oc.wrapping_add(4), hi);
+                    let (ents, shift, fb) =
+                        (&core.mem.e, core.mem.stride_shift, core.mem.field_bytes);
+                    if let Some(w) = ent_field::<8>(ents, shift, fb, e, f) {
+                        set64!(oc, u64::from_le_bytes(*w));
                     } else {
                         let entity_ok = e < core.mem.num_edicts();
                         let words: usize = if entity_ok {
@@ -453,7 +466,14 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                 }
                 Op::Address => {
                     let (e, f) = (g(s, oa), g(s, ob));
-                    if e >= core.mem.num_edicts() {
+                    if core.mem.slots.get(usize_from(e)).is_some_and(|slot| !slot.protected) {
+                        let p = core
+                            .mem
+                            .e_base
+                            .wrapping_add(e.wrapping_shl(core.mem.stride_shift))
+                            .wrapping_add(f.wrapping_mul(4));
+                        set(s, oc, p);
+                    } else if e >= core.mem.num_edicts() {
                         core.x.pc = pc;
                         core.warn(WarningKind::BadEntity(e));
                     } else if core.mem.protected(e) {
@@ -466,16 +486,22 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                     }
                 }
                 Op::StoreFieldF | Op::StoreFieldS | Op::StoreFieldI => {
-                    core.x.pc = pc;
-                    store_field(core, oa, ob, oc, 1);
+                    if !store_field_fast::<4>(core, oa, ob, oc) {
+                        core.x.pc = pc;
+                        store_field(core, oa, ob, oc, 1);
+                    }
                 }
                 Op::StoreFieldV => {
-                    core.x.pc = pc;
-                    store_field(core, oa, ob, oc, 3);
+                    if !store_field_fast::<12>(core, oa, ob, oc) {
+                        core.x.pc = pc;
+                        store_field(core, oa, ob, oc, 3);
+                    }
                 }
                 Op::StoreFieldI64 => {
-                    core.x.pc = pc;
-                    store_field(core, oa, ob, oc, 2);
+                    if !store_field_fast::<8>(core, oa, ob, oc) {
+                        core.x.pc = pc;
+                        store_field(core, oa, ob, oc, 2);
+                    }
                 }
 
                 // ---- global stores -------------------------------------------------------
@@ -508,9 +534,13 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                 | Op::StorePFnc
                 | Op::StorePI => {
                     let (v, base, idx) = (g(s, oa), g(s, ob), g(s, oc));
-                    core.x.pc = pc;
-                    if let Err(k) = ptr_write(core, base, idx.wrapping_mul(4), &v.to_le_bytes()) {
-                        fault!(k);
+                    let p = base.wrapping_add(idx.wrapping_mul(4));
+                    if !fast_write(s, &mut core.mem.e, pointer_map!(), p, v.to_le_bytes()) {
+                        core.x.pc = pc;
+                        if let Err(k) = ptr_write(core, base, idx.wrapping_mul(4), &v.to_le_bytes())
+                        {
+                            fault!(k);
+                        }
                     }
                 }
                 Op::StorePV => {
@@ -521,9 +551,12 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                             &g(s, oa.wrapping_add(k.wrapping_mul(4))).to_le_bytes(),
                         );
                     }
-                    core.x.pc = pc;
-                    if let Err(k) = ptr_write(core, base, idx.wrapping_mul(4), &bytes) {
-                        fault!(k);
+                    let p = base.wrapping_add(idx.wrapping_mul(4));
+                    if !fast_write(s, &mut core.mem.e, pointer_map!(), p, bytes) {
+                        core.x.pc = pc;
+                        if let Err(k) = ptr_write(core, base, idx.wrapping_mul(4), &bytes) {
+                            fault!(k);
+                        }
                     }
                 }
                 Op::StorePI64 => {
@@ -706,6 +739,16 @@ fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) 
                     let v = (f2i(gf(s, ob)) & !f2i(gf(s, oa))) as f32;
                     setf(s, ob, v);
                 }
+                Op::MulStorePF | Op::DivStorePF | Op::AddStorePF | Op::SubStorePF
+                    if compound_store_fast(
+                        s,
+                        &mut core.mem.e,
+                        pointer_map!(),
+                        st.op,
+                        oa,
+                        ob,
+                        oc,
+                    ) => {}
                 Op::MulStorePF
                 | Op::DivStorePF
                 | Op::AddStorePF
@@ -1351,6 +1394,126 @@ fn copy(s: &mut [u8], src: usize, dst: usize, words: usize) {
         let v = g(s, src.wrapping_add(k));
         set(s, dst.wrapping_add(k), v);
     }
+}
+
+/// The `N` bytes of field `f` of entity `e` in region E, if the entity and field are valid.
+/// Region E holds exactly `num_edicts` blocks of `1 << shift` bytes and fields lie within the first
+/// `field_bytes` of a block, so the slice bound also checks the entity number.
+#[inline(always)]
+fn ent_field<const N: usize>(ents: &[u8], shift: u32, fb: u32, e: u32, f: u32) -> Option<&[u8; N]> {
+    let within = u64::from(f).wrapping_mul(4);
+    if within.wrapping_add(N as u64) > u64::from(fb) {
+        return None;
+    }
+    let off = usize::try_from(u64::from(e).wrapping_shl(shift).wrapping_add(within)).ok()?;
+    ents.get(off..)?.first_chunk::<N>()
+}
+
+/// `STOREF_*` when entity and field are valid and the entity is writable: copies `N` bytes from
+/// global `oc`. Returns false, having done nothing, otherwise.
+#[inline(always)]
+fn store_field_fast<const N: usize>(core: &mut Core, oa: usize, ob: usize, oc: usize) -> bool {
+    let s = core.mem.s.as_slice();
+    let (e, f) = (g(s, oa), g(s, ob));
+    let Some(v) = s.get(oc..).and_then(<[u8]>::first_chunk::<N>) else { return false };
+    let within = u64::from(f).wrapping_mul(4);
+    if within.wrapping_add(N as u64) > u64::from(core.mem.field_bytes)
+        || core.mem.slots.get(usize_from(e)).is_none_or(|slot| slot.protected)
+    {
+        return false;
+    }
+    let off = u64::from(e).wrapping_shl(core.mem.stride_shift).wrapping_add(within);
+    let Ok(off) = usize::try_from(off) else { return false };
+    match core.mem.e.get_mut(off..).and_then(<[u8]>::first_chunk_mut::<N>) {
+        Some(dst) => {
+            *dst = *v;
+            true
+        }
+        None => false,
+    }
+}
+
+/// What the pointer fast paths need to know about entity memory.
+struct PointerMap<'a> {
+    e_base: u32,
+    shift: u32,
+    field_bytes: u32,
+    slots: &'a [EntSlot],
+}
+
+/// Where an `n`-byte write to pointer `p` lands on the common paths: region S (`Ok`) or an
+/// unprotected entity field in region E (`Err`), tested in the same order as
+/// `Memory::locate`. `None` for everything else — null, the heap, temp strings, the sentinel,
+/// protected entities, invalid pointers — which the general path handles.
+#[inline(always)]
+fn fast_target(s_len: usize, map: &PointerMap<'_>, p: u32, n: u32) -> Option<Result<usize, usize>> {
+    let end = u64::from(p).wrapping_add(u64::from(n));
+    if end <= s_len as u64 {
+        return (p != 0).then_some(Ok(usize_from(p)));
+    }
+    let off = p.checked_sub(map.e_base)?;
+    let e = off.wrapping_shr(map.shift);
+    let within = off & 1u32.wrapping_shl(map.shift).wrapping_sub(1);
+    let slot = map.slots.get(usize_from(e))?;
+    (u64::from(within).wrapping_add(u64::from(n)) <= u64::from(map.field_bytes) && !slot.protected)
+        .then_some(Err(usize_from(off)))
+}
+
+/// Writes `bytes` through pointer `p` if it lands on a common path (see [`fast_target`]).
+/// Returns false, having written nothing, otherwise.
+#[inline(always)]
+fn fast_write<const N: usize>(
+    s: &mut [u8],
+    ents: &mut [u8],
+    map: PointerMap<'_>,
+    p: u32,
+    bytes: [u8; N],
+) -> bool {
+    let (region, o) = match fast_target(s.len(), &map, p, N as u32) {
+        Some(Ok(o)) => (s, o),
+        Some(Err(o)) => (ents, o),
+        None => return false,
+    };
+    match region.get_mut(o..).and_then(<[u8]>::first_chunk_mut::<N>) {
+        Some(dst) => {
+            *dst = bytes;
+            true
+        }
+        None => false,
+    }
+}
+
+/// `MULSTOREP_F`, `DIVSTOREP_F`, `ADDSTOREP_F`, `SUBSTOREP_F` when the pointer lands on a common
+/// path: `*B op= A`, then `C` = the new value. Returns false, having done nothing, otherwise.
+#[inline(always)]
+fn compound_store_fast(
+    s: &mut [u8],
+    ents: &mut [u8],
+    map: PointerMap<'_>,
+    op: Op,
+    oa: usize,
+    ob: usize,
+    oc: usize,
+) -> bool {
+    let (p, a) = (g(s, ob), gf(s, oa));
+    let (region, o): (&mut [u8], usize) = match fast_target(s.len(), &map, p, 4) {
+        Some(Ok(o)) => (&mut *s, o),
+        Some(Err(o)) => (ents, o),
+        None => return false,
+    };
+    let Some(word) = region.get_mut(o..).and_then(<[u8]>::first_chunk_mut::<4>) else {
+        return false;
+    };
+    let b = f32::from_le_bytes(*word);
+    let v = match op {
+        Op::MulStorePF => b * a,
+        Op::DivStorePF => b / a,
+        Op::AddStorePF => b + a,
+        _ => b - a,
+    };
+    *word = v.to_le_bytes();
+    setf(s, oc, v);
+    true
 }
 
 /// Warns about an invalid entity or field in a field load.

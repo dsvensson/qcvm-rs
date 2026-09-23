@@ -283,6 +283,8 @@ impl Memory {
         while self.slots.len() < slots {
             self.slots.push(EntSlot { in_use: false, protected: false, freetime: 0.0, serial: 0 });
         }
+        // The interpreter's field fast paths rely on this: the slice bound checks the entity.
+        debug_assert_eq!(self.e.len(), self.slots.len().wrapping_shl(self.stride_shift));
         Ok(())
     }
 
