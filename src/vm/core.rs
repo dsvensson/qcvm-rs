@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::bytes::usize_from;
 use crate::error::{Backtrace, BacktraceFrame, ErrorKind, Warning, WarningKind};
-use crate::progs::{FunctionKind, Program, Stmt, Type};
+use crate::progs::{FunctionKind, ParamCopy, Program, Stmt, Type};
 use crate::value::FuncRef;
 use crate::vm::config::VmConfig;
 use crate::vm::memory::Memory;
@@ -49,6 +49,10 @@ pub(crate) struct Exec {
     /// Absolute byte offset (in region S) of the global a `SWITCH` refers to.
     pub(crate) switch_ref: u32,
     pub(crate) switch_kind: SwitchKind,
+    /// Byte address in region S of the current function's locals, and how many words they are
+    /// (saved on the local stack while it runs, restored when it returns).
+    pub(crate) locals_addr: u32,
+    pub(crate) locals_words: u32,
 }
 
 impl Default for Exec {
@@ -61,6 +65,8 @@ impl Default for Exec {
             ls_top: 0,
             switch_ref: 0,
             switch_kind: SwitchKind::Float,
+            locals_addr: 0,
+            locals_words: 0,
         }
     }
 }
@@ -76,6 +82,23 @@ pub(crate) struct Frame {
     pub(crate) switch_kind: SwitchKind,
     /// Local-stack word where the callee's saved locals start.
     pub(crate) locals_at: u32,
+    /// The caller's [`Exec::locals_addr`] and [`Exec::locals_words`].
+    pub(crate) locals_addr: u32,
+    pub(crate) locals_words: u32,
+}
+
+/// What entering a QuakeC function needs, with absolute addresses, so a call looks nothing up in
+/// its [`Program`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QcFunc {
+    /// First statement.
+    pub(crate) entry: u32,
+    /// Byte address in region S of its locals (parameters first), and how many words they are.
+    pub(crate) locals_addr: u32,
+    pub(crate) locals_words: u32,
+    /// Its parameter copies: `ProgsState::copies[copies_start..copies_end]`.
+    pub(crate) copies_start: u32,
+    pub(crate) copies_end: u32,
 }
 
 /// How a function slot is dispatched.
@@ -112,12 +135,55 @@ pub(crate) struct ProgsState {
     /// in region S (so the interpreter does not add the globals base to every operand).
     pub(crate) code: Arc<[Stmt]>,
     pub(crate) callees: Box<[Callee]>,
+    /// Call information for each function (`None`: not a QuakeC function).
+    pub(crate) funcs: Box<[Option<QcFunc>]>,
+    /// The parameter copies of all functions, with absolute addresses.
+    pub(crate) copies: Box<[ParamCopy]>,
     pub(crate) state: StateHandles,
     /// This progs' copy of each shared-global slot (see `multiprogs`).
     pub(crate) shared: Vec<Option<crate::vm::multiprogs::SharedGlobal>>,
 }
 
 impl ProgsState {
+    /// The state of `program` loaded with its globals at `gbase`.
+    pub(crate) fn new(
+        program: Arc<Program>,
+        gbase: u32,
+        callees: Box<[Callee]>,
+        state: StateHandles,
+    ) -> Self {
+        let mut copies = Vec::new();
+        let funcs = program
+            .functions
+            .iter()
+            .map(|f| {
+                let FunctionKind::QuakeC { entry } = f.kind else { return None };
+                let copies_start = u32::try_from(copies.len()).ok()?;
+                copies.extend(program.copies(f).iter().map(|c| ParamCopy {
+                    src: c.src.wrapping_add(gbase),
+                    dst: c.dst.wrapping_add(gbase),
+                }));
+                Some(QcFunc {
+                    entry,
+                    locals_addr: gbase.wrapping_add(f.parm_start.wrapping_mul(4)),
+                    locals_words: f.locals,
+                    copies_start,
+                    copies_end: u32::try_from(copies.len()).ok()?,
+                })
+            })
+            .collect();
+        Self {
+            code: relocate(&program, gbase),
+            gbase,
+            callees,
+            funcs,
+            copies: copies.into(),
+            state,
+            shared: Vec::new(),
+            program,
+        }
+    }
+
     pub(crate) fn num_globals(&self) -> u32 {
         self.program.num_globals()
     }
@@ -307,38 +373,28 @@ impl Core {
         if prnum != self.x.prnum && self.progs.len() > 1 {
             crate::vm::multiprogs::switch_in(self, self.x.prnum, prnum);
         }
-        let ps = self
-            .progs
-            .get(usize::from(prnum))
-            .ok_or(ErrorKind::InvalidFunction(FuncRef::new(crate::value::PrNum(prnum), index)))?;
-        let program = &ps.program;
-        let gbase = usize_from(ps.gbase);
-        let f = program
-            .func(index)
-            .ok_or(ErrorKind::InvalidFunction(FuncRef::new(crate::value::PrNum(prnum), index)))?;
-        let FunctionKind::QuakeC { entry } = f.kind else {
-            return Err(ErrorKind::InvalidFunction(FuncRef::new(
-                crate::value::PrNum(prnum),
-                index,
-            )));
-        };
+        let invalid =
+            || ErrorKind::InvalidFunction(FuncRef::new(crate::value::PrNum(prnum), index));
+        let ps = self.progs.get(usize::from(prnum)).ok_or_else(invalid)?;
+        let f = ps.funcs.get(usize_from(index)).copied().flatten().ok_or_else(invalid)?;
 
         // Keep the caller's pushed memory, then save the callee's locals.
         let ls_top = self.x.ls_top.checked_add(self.x.pushed).ok_or(ErrorKind::LocalStack)?;
-        let new_top = ls_top.checked_add(f.locals).ok_or(ErrorKind::LocalStack)?;
+        let new_top = ls_top.checked_add(f.locals_words).ok_or(ErrorKind::LocalStack)?;
         if new_top > self.mem.ls_words {
             return Err(ErrorKind::LocalStack);
         }
-        let locals_at = gbase.saturating_add(usize_from(f.parm_start).saturating_mul(4));
         let save_at =
             usize_from(self.mem.ls_base).saturating_add(usize_from(ls_top).saturating_mul(4));
-        let len = usize_from(f.locals).saturating_mul(4);
-        if !self.mem.move_s(locals_at, save_at, len) {
+        let len = usize_from(f.locals_words).saturating_mul(4);
+        if !self.mem.move_s(usize_from(f.locals_addr), save_at, len) {
             return Err(ErrorKind::LocalStack);
         }
-        for c in program.copies(f) {
-            let v = self.mem.g(gbase.wrapping_add(usize_from(c.src)));
-            self.mem.set_g(gbase.wrapping_add(usize_from(c.dst)), v);
+        let copies =
+            ps.copies.get(usize_from(f.copies_start)..usize_from(f.copies_end)).unwrap_or_default();
+        for c in copies {
+            let v = self.mem.g(usize_from(c.src));
+            self.mem.set_g(usize_from(c.dst), v);
         }
 
         self.frames.push(Frame {
@@ -349,15 +405,19 @@ impl Core {
             switch_ref: self.x.switch_ref,
             switch_kind: self.x.switch_kind,
             locals_at: ls_top,
+            locals_addr: self.x.locals_addr,
+            locals_words: self.x.locals_words,
         });
         self.x = Exec {
-            pc: entry,
+            pc: f.entry,
             func: index,
             prnum,
             pushed: 0,
             ls_top: new_top,
             switch_ref: 0,
             switch_kind: SwitchKind::Float,
+            locals_addr: f.locals_addr,
+            locals_words: f.locals_words,
         };
         Ok(())
     }
@@ -366,23 +426,20 @@ impl Core {
     #[inline(never)]
     pub(crate) fn leave(&mut self) {
         let callee_prnum = self.x.prnum;
-        if let Some(ps) = self.progs.get(usize::from(self.x.prnum))
-            && let Some(f) = ps.program.func(self.x.func)
-        {
-            let gbase = usize_from(ps.gbase);
-            let top = self.x.ls_top.saturating_sub(f.locals);
-            let locals_at = gbase.saturating_add(usize_from(f.parm_start).saturating_mul(4));
-            let saved_at =
-                usize_from(self.mem.ls_base).saturating_add(usize_from(top).saturating_mul(4));
-            self.mem.move_s(saved_at, locals_at, usize_from(f.locals).saturating_mul(4));
-            self.x.ls_top = top;
-        }
+        let top = self.x.ls_top.saturating_sub(self.x.locals_words);
+        let saved_at =
+            usize_from(self.mem.ls_base).saturating_add(usize_from(top).saturating_mul(4));
+        let len = usize_from(self.x.locals_words).saturating_mul(4);
+        self.mem.move_s(saved_at, usize_from(self.x.locals_addr), len);
+        self.x.ls_top = top;
         if let Some(frame) = self.frames.pop() {
             self.x.ls_top = self.x.ls_top.saturating_sub(frame.pushed);
             self.x.pc = frame.resume_pc;
             self.x.func = frame.func;
             self.x.prnum = frame.prnum;
             self.x.pushed = frame.pushed;
+            self.x.locals_addr = frame.locals_addr;
+            self.x.locals_words = frame.locals_words;
             if self.config.compat.switch_reset_on_call {
                 self.x.switch_ref = 0;
                 self.x.switch_kind = SwitchKind::Float;

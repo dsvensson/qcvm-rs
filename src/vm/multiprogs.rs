@@ -341,14 +341,7 @@ impl<H: Host> Vm<H> {
 
         let callees = super::bind(&program, &self.builtins);
         let state = state_handles(&program, gbase_u32, &self.core.fields);
-        self.core.progs.push(ProgsState {
-            code: super::core::relocate(&program, gbase_u32),
-            program: Arc::clone(&program),
-            gbase: gbase_u32,
-            callees,
-            state,
-            shared: Vec::new(),
-        });
+        self.core.progs.push(ProgsState::new(Arc::clone(&program), gbase_u32, callees, state));
         register_shared(&mut self.core, pr);
         link_externs(&mut self.core);
 
