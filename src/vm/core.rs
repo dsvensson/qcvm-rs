@@ -221,7 +221,13 @@ pub(crate) struct Core {
     pub(crate) warnings: Vec<Warning>,
     pub(crate) warnings_this_call: u32,
     pub(crate) suppressed: u32,
+    /// Statement tracing (`traceon`): every statement is reported to [`Host::trace`] before it
+    /// runs.
+    ///
+    /// [`Host::trace`]: crate::Host::trace
     pub(crate) trace: bool,
+    /// Tracing: the statement at `x.pc` has been reported and runs next.
+    pub(crate) traced: bool,
     /// Field words zeroed by `remove`.
     pub(crate) remove_clears: Vec<u32>,
     /// Resolved [`crate::vm::SpawnDefault`]s.

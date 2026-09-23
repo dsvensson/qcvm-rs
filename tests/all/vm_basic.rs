@@ -683,3 +683,68 @@ fn reentrancy_limit_fits_a_small_thread_stack() {
     let stack = if cfg!(debug_assertions) { 1024 } else { 256 } * 1024;
     std::thread::Builder::new().stack_size(stack).spawn(run).unwrap().join().unwrap();
 }
+
+#[derive(Default)]
+struct Tracer {
+    lines: Vec<String>,
+}
+
+impl qcvm::Host for Tracer {
+    fn trace(&mut self, line: &str) {
+        self.lines.push(line.to_owned());
+    }
+}
+
+/// `traceon`/`traceoff` report every statement in between to `Host::trace`, including those of
+/// called functions.
+#[test]
+fn traceon_reports_statements() {
+    let mut asm = Asm::new();
+    let on = asm.builtin("traceon", 29, 0);
+    let off = asm.builtin("traceoff", 30, 0);
+    let (on_g, off_g) =
+        (asm.global("on_g", ty::FUNCTION, &[on]), asm.global("off_g", ty::FUNCTION, &[off]));
+    let (one, two) = (asm.float(1.0), asm.float(2.0));
+    let helper = asm.function("helper", &[], 1);
+    asm.emit(Op::MulF, two, two, helper.local(0));
+    asm.emit(Op::Return, helper.local(0), 0, 0);
+    let helper_g = asm.global("helper_g", ty::FUNCTION, &[helper.index]);
+    let f = asm.function("main", &[], 1);
+    asm.emit(Op::AddF, one, one, f.local(0));
+    asm.emit(Op::Call0, on_g, 0, 0);
+    asm.emit(Op::AddF, one, two, f.local(0));
+    asm.emit(Op::Call0, helper_g, 0, 0);
+    asm.emit(Op::Call0, off_g, 0, 0);
+    asm.emit(Op::SubF, one, two, f.local(0));
+    asm.emit(Op::Done, 0, 0, 0);
+    let program =
+        std::sync::Arc::new(qcvm::Program::parse(&asm.build(qcvm::ProgsFormat::Fte16)).unwrap());
+    let mut vm: Vm<Tracer> = Vm::new(
+        program,
+        std::sync::Arc::new(Builtins::standard(Numbering::Csqc)),
+        qcvm::VmConfig::default(),
+    )
+    .unwrap();
+    let mut host = Tracer::default();
+    let main = vm.find_function("main").unwrap();
+    vm.call(&mut host, main, &[]).unwrap();
+    let ops: Vec<String> = host
+        .lines
+        .iter()
+        .map(|l| {
+            let (func, rest) = l.split_once(": ").unwrap();
+            let op = rest.split_whitespace().nth(1).unwrap();
+            format!("{func} {op}")
+        })
+        .collect();
+    assert_eq!(
+        ops,
+        ["main ADD_F", "main CALL0", "helper MUL_F", "helper RETURN", "main CALL0"],
+        "{:#?}",
+        host.lines
+    );
+    assert!(!vm.is_tracing());
+    vm.set_trace(true);
+    vm.call(&mut host, main, &[]).unwrap();
+    assert!(host.lines.len() > 5 && host.lines[5].starts_with("main:"), "{:#?}", host.lines);
+}

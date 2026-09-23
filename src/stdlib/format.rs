@@ -6,7 +6,7 @@
 //! the exact decimal expansion of the double (so results are correctly rounded, exact ties go to
 //! the even digit), exponents have at least two digits, infinities and NaNs print as
 //! `inf`/`-nan`, strings and characters are padded with spaces even with the `0` flag. Output is
-//! written to a [`Sink`] with a byte cap, so huge widths or precisions never allocate more than
+//! written to a sink with a byte cap, so huge widths or precisions never allocate more than
 //! the cap.
 
 use crate::builtins::Builtins;

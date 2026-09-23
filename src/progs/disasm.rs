@@ -34,6 +34,19 @@ impl<'a> Disassembly<'a> {
             .unwrap_or(self.program.file_statements);
         (entry, end)
     }
+}
+
+/// One statement: opcode and operands, plus the source line if known; format it with `{}`.
+#[derive(Clone, Copy, Debug)]
+pub struct StatementText<'a> {
+    program: &'a Program,
+    index: u32,
+}
+
+impl<'a> StatementText<'a> {
+    pub(super) fn new(program: &'a Program, index: u32) -> Self {
+        Self { program, index }
+    }
 
     fn global(&self, f: &mut fmt::Formatter<'_>, byte_offset: u32) -> fmt::Result {
         let word = byte_offset / 4;
@@ -50,6 +63,34 @@ impl<'a> Disassembly<'a> {
                 Ok(())
             }
         }
+    }
+}
+
+impl fmt::Display for StatementText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let index = self.index;
+        let Some(stmt) = self.program.statements.get(usize_from(index)) else {
+            return write!(f, "{index:6}: <no statement>");
+        };
+        write!(f, "{index:6}: {:<14}", stmt.op.name())?;
+        let mut first = true;
+        for (kind, value) in stmt.op.operands().iter().zip([stmt.a, stmt.b, stmt.c]) {
+            if *kind == Operand::Unused {
+                continue;
+            }
+            f.write_str(if first { " " } else { ", " })?;
+            first = false;
+            match kind {
+                Operand::Global => self.global(f, value)?,
+                Operand::GlobalIndex => write!(f, "&g{value}")?,
+                Operand::Jump => write!(f, "-> {value}")?,
+                Operand::Immediate | Operand::Unused => write!(f, "{value}")?,
+            }
+        }
+        if let Some(line) = self.program.source_line(index) {
+            write!(f, "    ; line {line}")?;
+        }
+        Ok(())
     }
 }
 
@@ -76,28 +117,7 @@ impl fmt::Display for Disassembly<'_> {
         )?;
         let (start, end) = self.range(entry);
         for index in start..end {
-            let Some(stmt) = self.program.statements.get(usize_from(index)) else {
-                break;
-            };
-            write!(f, "{index:6}: {:<14}", stmt.op.name())?;
-            let mut first = true;
-            for (kind, value) in stmt.op.operands().iter().zip([stmt.a, stmt.b, stmt.c]) {
-                if *kind == Operand::Unused {
-                    continue;
-                }
-                f.write_str(if first { " " } else { ", " })?;
-                first = false;
-                match kind {
-                    Operand::Global => self.global(f, value)?,
-                    Operand::GlobalIndex => write!(f, "&g{value}")?,
-                    Operand::Jump => write!(f, "-> {value}")?,
-                    Operand::Immediate | Operand::Unused => write!(f, "{value}")?,
-                }
-            }
-            if let Some(line) = self.program.source_line(index) {
-                write!(f, "    ; line {line}")?;
-            }
-            writeln!(f)?;
+            writeln!(f, "{}", StatementText::new(self.program, index))?;
         }
         Ok(())
     }

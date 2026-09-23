@@ -204,6 +204,12 @@ pub trait Host: Sized {
         Ok(false)
     }
 
+    /// Receives one line per statement while tracing is on (`traceon`, [`Vm::set_trace`]): the
+    /// function name and the statement's disassembly. Default: nothing.
+    fn trace(&mut self, line: &str) {
+        let _ = line;
+    }
+
     /// Called after `spawn` (from QuakeC or the host) allocated an entity. Default: nothing.
     fn on_spawn(&mut self, vm: &mut Vm<Self>, e: crate::value::EntRef) {
         let _ = (vm, e);

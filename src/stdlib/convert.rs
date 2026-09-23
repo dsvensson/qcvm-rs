@@ -70,7 +70,8 @@ pub(crate) fn ftos_text(v: f32) -> Vec<u8> {
     s
 }
 
-/// `string ftos(float)`: see [`ftos_text`].
+/// `string ftos(float)`: integral values as integers, others with the digits FTE prints
+/// (`docs/spec/strings.md`).
 ///
 /// # Errors
 /// Only if the result string cannot be allocated.
@@ -507,7 +508,7 @@ pub(crate) fn parse_vector(s: &[u8]) -> [f32; 3] {
     out
 }
 
-/// `vector stov(string...)`: parses `'x y z'` (see [`parse_vector`]); the arguments are
+/// `vector stov(string...)`: parses `'x y z'` (`docs/spec/strings.md`); the arguments are
 /// concatenated.
 ///
 /// # Errors

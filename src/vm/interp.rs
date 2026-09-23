@@ -67,12 +67,15 @@ pub(crate) enum Exit {
     Builtin { slot: u32, func: FuncRef },
     /// An animation opcode; execution resumes after it.
     StateOp(StateOp),
+    /// Tracing: the statement at `core.x.pc` is about to run and should be reported first.
+    Trace,
     /// A fatal error.
     Fault(ErrorKind),
 }
 
 /// Runs until the frame stack returns to `exit_depth`, a builtin must be called, or a fault.
-pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit {
+/// With `TRACE`, also stops before every statement that has not been reported yet.
+pub(crate) fn run<const TRACE: bool>(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit {
     // The current progs' relocated statements, cloned once and refreshed only when a call or
     // return switches progs (not on every call, which would cost two atomic operations each).
     let mut cached_pr = u8::MAX;
@@ -122,6 +125,14 @@ pub(crate) fn run(core: &mut Core, exit_depth: usize, budget: &mut u32) -> Exit 
         }
 
         loop {
+            if TRACE {
+                if !core.traced {
+                    core.traced = true;
+                    core.x.pc = pc;
+                    return Exit::Trace;
+                }
+                core.traced = false;
+            }
             let Some(&st) = stmts.get(usize_from(pc)) else {
                 fault!(ErrorKind::JumpOutOfRange);
             };

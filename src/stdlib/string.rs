@@ -554,7 +554,8 @@ pub(crate) fn change_case(s: &[u8], scheme: CharScheme, upper: bool) -> Vec<u8> 
     out
 }
 
-/// `string strtolower(string)`: ASCII letters to lower case (see [`change_case`]).
+/// `string strtolower(string)`: ASCII letters to lower case (other characters, Quake's red
+/// letters included, pass through the VM's charset unchanged).
 ///
 /// # Errors
 /// Only if the result string cannot be allocated.
@@ -563,7 +564,8 @@ pub fn strtolower<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError>
     vm.ret_str(&out)
 }
 
-/// `string strtoupper(string)`: ASCII letters to upper case (see [`change_case`]).
+/// `string strtoupper(string)`: ASCII letters to upper case (other characters, Quake's red
+/// letters included, pass through the VM's charset unchanged).
 ///
 /// # Errors
 /// Only if the result string cannot be allocated.
@@ -839,7 +841,8 @@ pub(crate) fn decolorize(s: &[u8], scheme: CharScheme) -> Vec<u8> {
     out
 }
 
-/// `string strdecolorize(string)`: see [`decolorize`].
+/// `string strdecolorize(string)`: the text without colour codes and markup
+/// (`docs/spec/strings.md`).
 ///
 /// # Errors
 /// Only if the result string cannot be allocated.

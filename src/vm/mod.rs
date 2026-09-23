@@ -451,7 +451,12 @@ impl<H: Host> Vm<H> {
     fn execute_inner(&mut self, host: &mut H, exit_depth: usize) -> Result<(), VmError> {
         let mut budget = self.core.config.limits.runaway;
         loop {
-            let exit = interp::run(&mut self.core, exit_depth, &mut budget);
+            let exit = if self.core.trace {
+                interp::run::<true>(&mut self.core, exit_depth, &mut budget)
+            } else {
+                self.core.traced = false;
+                interp::run::<false>(&mut self.core, exit_depth, &mut budget)
+            };
             match exit {
                 Exit::Returned => {
                     self.flush_warnings(host);
@@ -476,8 +481,37 @@ impl<H: Host> Vm<H> {
                     self.flush_warnings(host);
                     return Err(self.fail(kind.into(), exit_depth));
                 }
+                Exit::Trace => {
+                    let line = self.trace_line();
+                    host.trace(&line);
+                }
             }
         }
+    }
+
+    /// The statement about to run, for [`Host::trace`]: `function: disassembly`.
+    fn trace_line(&self) -> String {
+        let x = &self.core.x;
+        match self.core.progs.get(usize::from(x.prnum)) {
+            Some(ps) => {
+                let name = ps.program.function(x.func).map_or(&b"?"[..], |f| f.name);
+                let stmt = ps.program.disassemble_statement(x.pc);
+                format!("{}: {stmt}", String::from_utf8_lossy(name))
+            }
+            None => format!("?: statement {}", x.pc),
+        }
+    }
+
+    /// Switches statement tracing on or off (what `traceon`/`traceoff` do): while on, every
+    /// statement is passed to [`Host::trace`] before it runs.
+    pub fn set_trace(&mut self, on: bool) {
+        self.core.trace = on;
+    }
+
+    /// Whether statement tracing is on.
+    #[must_use]
+    pub fn is_tracing(&self) -> bool {
+        self.core.trace
     }
 
     /// Calls builtin `slot`, applying FTE's builtin-error rules.
@@ -1116,6 +1150,7 @@ fn build_core<H: Host>(
         warnings_this_call: 0,
         suppressed: 0,
         trace: false,
+        traced: false,
         remove_clears,
         spawn_defaults,
         std: crate::stdlib::StdState::default(),

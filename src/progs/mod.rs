@@ -13,7 +13,7 @@ mod load;
 use std::collections::HashMap;
 use std::fmt;
 
-pub use disasm::Disassembly;
+pub use disasm::{Disassembly, StatementText};
 
 use crate::bytes::{cstr_at, usize_from};
 use crate::opcode::Op;
@@ -627,6 +627,12 @@ impl Program {
     #[must_use]
     pub fn disassemble(&self, index: u32) -> Disassembly<'_> {
         Disassembly::new(self, index)
+    }
+
+    /// A printable disassembly of the single statement `index`.
+    #[must_use]
+    pub fn disassemble_statement(&self, index: u32) -> StatementText<'_> {
+        StatementText::new(self, index)
     }
 
     pub(crate) fn func(&self, index: u32) -> Option<&Function> {
