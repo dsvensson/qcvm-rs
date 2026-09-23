@@ -22,4 +22,5 @@ mod license;
 mod loader;
 mod multiprogs;
 mod opcodes;
+mod threads;
 mod vm_basic;

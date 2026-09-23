@@ -74,6 +74,8 @@ pub(crate) struct Frame {
     pub(crate) pushed: u32,
     pub(crate) switch_ref: u32,
     pub(crate) switch_kind: SwitchKind,
+    /// Local-stack word where the callee's saved locals start.
+    pub(crate) locals_at: u32,
 }
 
 /// How a function slot is dispatched.
@@ -203,6 +205,10 @@ pub(crate) struct Core {
     pub(crate) abort_ret: Option<[u32; 3]>,
     /// Globals kept in sync between progs.
     pub(crate) shared: crate::vm::multiprogs::SharedTable,
+    /// Frame depth the innermost running `execute` returns at (the nearest engine boundary).
+    pub(crate) entry_depth: usize,
+    /// Sleeping QuakeC threads (`sleep`, `fork`).
+    pub(crate) threads: Vec<crate::vm::threads::Thread>,
 }
 
 impl Core {
@@ -293,6 +299,7 @@ impl Core {
             pushed: self.x.pushed,
             switch_ref: self.x.switch_ref,
             switch_kind: self.x.switch_kind,
+            locals_at: ls_top,
         });
         self.x = Exec {
             pc: entry,

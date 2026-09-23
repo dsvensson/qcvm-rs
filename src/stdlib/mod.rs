@@ -23,6 +23,7 @@ pub mod reflect;
 pub mod strbuf;
 pub mod strftime;
 pub mod string;
+pub mod threads;
 pub mod time;
 pub mod tokenize;
 pub(crate) mod util;
@@ -57,6 +58,7 @@ pub(crate) fn register_all<H: Host>(b: &mut Builtins<H>) {
     strbuf::register(b);
     strftime::register(b);
     string::register(b);
+    threads::register(b);
     time::register(b);
     tokenize::register(b);
     vector::register(b);

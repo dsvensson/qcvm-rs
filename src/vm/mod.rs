@@ -10,6 +10,7 @@ pub(crate) mod memory;
 pub(crate) mod multiprogs;
 pub(crate) mod num;
 pub(crate) mod strings;
+pub(crate) mod threads;
 
 use std::fmt;
 use std::sync::Arc;
@@ -440,6 +441,13 @@ impl<H: Host> Vm<H> {
 
     /// Runs the interpreter until the frame stack is back at `exit_depth`.
     fn execute(&mut self, host: &mut H, exit_depth: usize) -> Result<(), VmError> {
+        let saved_entry = std::mem::replace(&mut self.core.entry_depth, exit_depth);
+        let result = self.execute_inner(host, exit_depth);
+        self.core.entry_depth = saved_entry;
+        result
+    }
+
+    fn execute_inner(&mut self, host: &mut H, exit_depth: usize) -> Result<(), VmError> {
         let mut budget = self.core.config.limits.runaway;
         loop {
             let exit = interp::run(&mut self.core, exit_depth, &mut budget);
@@ -591,7 +599,8 @@ impl<H: Host> Vm<H> {
 
     fn collect_garbage_now(&mut self) -> GcStats {
         let mem = &self.core.mem;
-        let roots = [&mem.s[..], &mem.e[..], &mem.heap.data[..]];
+        let mut roots = vec![&mem.s[..], &mem.e[..], &mem.heap.data[..]];
+        roots.extend(self.core.threads.iter().map(threads::Thread::root_bytes));
         self.core.strings.collect(roots)
     }
 
@@ -1103,6 +1112,8 @@ fn build_core<H: Host>(
         std: crate::stdlib::StdState::default(),
         abort_ret: None,
         shared: multiprogs::SharedTable::default(),
+        entry_depth: 0,
+        threads: Vec::new(),
         config,
     };
     multiprogs::register_shared(&mut core, 0);
