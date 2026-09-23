@@ -26,8 +26,14 @@ use crate::host::Host;
 use crate::vm::Vm;
 use crate::vm::core::Core;
 
+use super::convert::{atof, strtol};
 use super::introspect::soft_error;
 use super::memory::heap_alloc;
+
+/// C's `atoi`: `strtol` in base 10, truncated to `int`.
+fn atoi(s: &[u8]) -> i32 {
+    strtol(s, 10) as i32
+}
 
 /// Registers this module's builtins.
 pub(crate) fn register<H: Host>(b: &mut Builtins<H>) {
@@ -425,115 +431,6 @@ fn unescape(body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// C's `atof` on a byte string (leading whitespace, sign, decimal or hexadecimal digits,
-/// `inf`/`infinity`/`nan`); 0 if nothing parses.
-pub(crate) fn c_atof(s: &[u8]) -> f64 {
-    let s = s.trim_ascii_start();
-    let (neg, body) = match s.split_first() {
-        Some((b'-', rest)) => (true, rest),
-        Some((b'+', rest)) => (false, rest),
-        _ => (false, s),
-    };
-    let lower: Vec<u8> = body.iter().take(8).map(u8::to_ascii_lowercase).collect();
-    let v = if lower.starts_with(b"inf") {
-        f64::INFINITY
-    } else if lower.starts_with(b"nan") {
-        f64::NAN
-    } else if lower.starts_with(b"0x") {
-        hex_float(body.get(2..).unwrap_or_default())
-    } else {
-        decimal_float(body)
-    };
-    if neg { -v } else { v }
-}
-
-/// The longest decimal floating-point prefix of `s`.
-fn decimal_float(s: &[u8]) -> f64 {
-    let digits = |from: usize| {
-        s.get(from..).map_or(0, |t| t.iter().take_while(|c| c.is_ascii_digit()).count())
-    };
-    let mut end = digits(0);
-    let mut mantissa_digits = end;
-    if s.get(end) == Some(&b'.') {
-        let frac = digits(end.saturating_add(1));
-        mantissa_digits = mantissa_digits.saturating_add(frac);
-        end = end.saturating_add(1).saturating_add(frac);
-    }
-    if mantissa_digits == 0 {
-        return 0.0;
-    }
-    if matches!(s.get(end), Some(b'e' | b'E')) {
-        let mut e = end.saturating_add(1);
-        if matches!(s.get(e), Some(b'+' | b'-')) {
-            e = e.saturating_add(1);
-        }
-        let n = digits(e);
-        if n > 0 {
-            end = e.saturating_add(n);
-        }
-    }
-    std::str::from_utf8(s.get(..end).unwrap_or_default())
-        .ok()
-        .and_then(|t| t.parse().ok())
-        .unwrap_or(0.0)
-}
-
-/// A hexadecimal floating-point number (after `0x`), like `strtod`.
-fn hex_float(s: &[u8]) -> f64 {
-    let mut value = 0.0f64;
-    let mut scale = 0i32;
-    let mut i = 0usize;
-    let mut seen = false;
-    while let Some(d) = s.get(i).copied().and_then(hex) {
-        value = value * 16.0 + f64::from(d);
-        seen = true;
-        i = i.saturating_add(1);
-    }
-    if s.get(i) == Some(&b'.') {
-        i = i.saturating_add(1);
-        while let Some(d) = s.get(i).copied().and_then(hex) {
-            value = value * 16.0 + f64::from(d);
-            scale = scale.saturating_sub(4);
-            seen = true;
-            i = i.saturating_add(1);
-        }
-    }
-    if !seen {
-        return 0.0;
-    }
-    if matches!(s.get(i), Some(b'p' | b'P')) {
-        let rest = s.get(i.saturating_add(1)..).unwrap_or_default();
-        let (neg, digits) = match rest.split_first() {
-            Some((b'-', r)) => (true, r),
-            Some((b'+', r)) => (false, r),
-            _ => (false, rest),
-        };
-        let mut exp = 0i32;
-        for &c in digits.iter().take_while(|c| c.is_ascii_digit()) {
-            exp = exp.saturating_mul(10).saturating_add(i32::from(c.wrapping_sub(b'0')));
-        }
-        scale = scale.saturating_add(if neg { exp.saturating_neg() } else { exp });
-    }
-    value * libm::exp2(f64::from(scale))
-}
-
-/// C's `atoi`: `strtol` in base 10, truncated to `int`.
-pub(crate) fn c_atoi(s: &[u8]) -> i32 {
-    let s = s.trim_ascii_start();
-    let (neg, digits) = match s.split_first() {
-        Some((b'-', rest)) => (true, rest),
-        Some((b'+', rest)) => (false, rest),
-        _ => (false, s),
-    };
-    let mut v: i64 = 0;
-    for &c in digits.iter().take_while(|c| c.is_ascii_digit()) {
-        v = v.saturating_mul(10).saturating_add(i64::from(c.wrapping_sub(b'0')));
-    }
-    let v = if neg { v.saturating_neg() } else { v };
-    // `long` → `int` keeps the low 32 bits.
-    i32::from_ne_bytes(v.to_ne_bytes().get(..4).and_then(|b| b.try_into().ok()).unwrap_or([0; 4]))
-}
-
 // ---- layout -----------------------------------------------------------------------------------
 
 struct Layout<'a, H: Host> {
@@ -586,7 +483,7 @@ impl<H: Host> Layout<'_, H> {
             Kind::Num(text) => {
                 let text = text.of(self.data);
                 // FTE reads at most 63 characters.
-                let v = c_atof(text.get(..text.len().min(63)).unwrap_or_default());
+                let v = atof(text.get(..text.len().min(63)).unwrap_or_default());
                 self.put(at.saturating_add(8), &number(v));
                 TYPE_NUMBER
             }
@@ -728,7 +625,7 @@ pub fn json_get_integer<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), Vm
     let n = node_arg(vm, 0)?;
     let v = match n.ty {
         TYPE_NUMBER | TYPE_TRUE | TYPE_FALSE => super::math::d2i(n.num()),
-        TYPE_STRING => c_atoi(vm.core.str_bytes(n.a).unwrap_or_default()),
+        TYPE_STRING => atoi(vm.core.str_bytes(n.a).unwrap_or_default()),
         _ => 0,
     };
     vm.ret_i32(v);
@@ -741,7 +638,7 @@ pub fn json_get_float<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmEr
     let n = node_arg(vm, 0)?;
     let v = match n.ty {
         TYPE_NUMBER | TYPE_TRUE | TYPE_FALSE => n.num() as f32,
-        TYPE_STRING => c_atof(vm.core.str_bytes(n.a).unwrap_or_default()) as f32,
+        TYPE_STRING => atof(vm.core.str_bytes(n.a).unwrap_or_default()) as f32,
         _ => 0.0,
     };
     vm.ret_f32(v);
@@ -804,18 +701,18 @@ mod tests {
 
     #[test]
     fn numbers() {
-        assert_eq!(c_atof(b"  -1.5e2x"), -150.0);
-        assert_eq!(c_atof(b"0x10"), 16.0);
-        assert_eq!(c_atof(b"0x1p-1"), 0.5);
-        assert!(c_atof(b"Infinity").is_infinite());
-        assert!(c_atof(b"nan").is_nan());
-        assert_eq!(c_atof(b".5"), 0.5);
-        assert_eq!(c_atof(b"abc"), 0.0);
-        assert_eq!(c_atof(b"1e"), 1.0);
-        assert_eq!(c_atoi(b" 42abc"), 42);
-        assert_eq!(c_atoi(b"-7"), -7);
-        assert_eq!(c_atoi(b"4294967297"), 1);
-        assert_eq!(c_atoi(b"99999999999999999999"), -1);
+        assert_eq!(atof(b"  -1.5e2x"), -150.0);
+        assert_eq!(atof(b"0x10"), 16.0);
+        assert_eq!(atof(b"0x1p-1"), 0.5);
+        assert!(atof(b"Infinity").is_infinite());
+        assert!(atof(b"nan").is_nan());
+        assert_eq!(atof(b".5"), 0.5);
+        assert_eq!(atof(b"abc"), 0.0);
+        assert_eq!(atof(b"1e"), 1.0);
+        assert_eq!(atoi(b" 42abc"), 42);
+        assert_eq!(atoi(b"-7"), -7);
+        assert_eq!(atoi(b"4294967297"), 1);
+        assert_eq!(atoi(b"99999999999999999999"), -1);
     }
 
     #[test]

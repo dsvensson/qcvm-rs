@@ -2,10 +2,10 @@
 
 //! sprintf and the C printf engine it is built on (docs/spec/strings.md).
 //!
-//! The engine reproduces glibc's `printf` output exactly: floating-point conversions work from
-//! the exact decimal expansion of the double (so results are correctly rounded, exact ties go to
-//! the even digit), exponents have at least two digits, infinities and NaNs print as
-//! `inf`/`-nan`, strings and characters are padded with spaces even with the `0` flag. Output is
+//! The engine reproduces glibc's `printf` output exactly. Floating-point digits come from
+//! `core::fmt`, which like glibc rounds the exact binary value correctly (exact ties to the even
+//! digit); the C conventions on top (exponents of at least two digits, `%g`, flags, `inf`/`nan`,
+//! strings and characters padded with spaces even with the `0` flag) are applied here. Output is
 //! written to a sink with a byte cap, so huge widths or precisions never allocate more than
 //! the cap.
 
@@ -21,155 +21,14 @@ pub(crate) fn register<H: Host>(b: &mut Builtins<H>) {
     b.set("sprintf", sprintf::<H>);
 }
 
-// ---- exact decimal expansion ------------------------------------------------------------------
+// ---- float digits -----------------------------------------------------------------------------
 
-const LIMB: u64 = 1_000_000_000;
-
-/// A natural number in base 10^9 (little-endian limbs; empty is zero).
-struct Big(Vec<u32>);
-
-impl Big {
-    fn from_u64(mut v: u64) -> Self {
-        let mut limbs = Vec::new();
-        while v != 0 {
-            limbs.push((v % LIMB) as u32);
-            v /= LIMB;
-        }
-        Self(limbs)
-    }
-
-    /// `self = self * k + add`.
-    fn mul_add(&mut self, k: u32, add: u32) {
-        let mut carry = u64::from(add);
-        for limb in &mut self.0 {
-            let x = u64::from(*limb).wrapping_mul(u64::from(k)).wrapping_add(carry);
-            *limb = (x % LIMB) as u32;
-            carry = x / LIMB;
-        }
-        while carry != 0 {
-            self.0.push((carry % LIMB) as u32);
-            carry /= LIMB;
-        }
-    }
-
-    fn mul_pow2(&mut self, mut e: u32) {
-        while e > 0 {
-            let step = e.min(29);
-            self.mul_add(1u32.wrapping_shl(step), 0);
-            e = e.saturating_sub(step);
-        }
-    }
-
-    fn mul_pow5(&mut self, mut e: u32) {
-        while e > 0 {
-            let step = e.min(13);
-            self.mul_add(5u32.wrapping_pow(step), 0);
-            e = e.saturating_sub(step);
-        }
-    }
-
-    /// Decimal digits (values 0–9), most significant first; empty for zero.
-    fn digits(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.0.len().saturating_mul(9));
-        for (i, limb) in self.0.iter().rev().enumerate() {
-            let text = if i == 0 { format!("{limb}") } else { format!("{limb:09}") };
-            out.extend(text.bytes().map(|b| b.wrapping_sub(b'0')));
-        }
-        out
-    }
-}
-
-/// A non-negative decimal `digits × 10^exp`: digits are values 0–9, most significant first,
-/// without leading or trailing zeros; no digits means zero.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Decimal {
-    digits: Vec<u8>,
-    exp: i64,
-}
-
-impl Decimal {
-    fn new(mut digits: Vec<u8>, mut exp: i64) -> Self {
-        let lead = digits.iter().take_while(|&&d| d == 0).count();
-        digits.drain(..lead);
-        while digits.last() == Some(&0) {
-            digits.pop();
-            exp = exp.saturating_add(1);
-        }
-        if digits.is_empty() {
-            exp = 0;
-        }
-        Self { digits, exp }
-    }
-
-    /// The exact value of `|v|` (`v` must be finite).
-    pub(crate) fn of(v: f64) -> Self {
-        let bits = v.to_bits();
-        let raw = ((bits >> 52) & 0x7FF) as i64;
-        let frac = bits & 0x000F_FFFF_FFFF_FFFF;
-        let (m, e) = if raw == 0 {
-            (frac, -1074)
-        } else {
-            (frac | 0x0010_0000_0000_0000, raw.wrapping_sub(1075))
-        };
-        let mut big = Big::from_u64(m);
-        if e >= 0 {
-            big.mul_pow2(u32::try_from(e).unwrap_or(0));
-            Self::new(big.digits(), 0)
-        } else {
-            big.mul_pow5(u32::try_from(e.unsigned_abs()).unwrap_or(0));
-            Self::new(big.digits(), e)
-        }
-    }
-
-    fn is_zero(&self) -> bool {
-        self.digits.is_empty()
-    }
-
-    fn len(&self) -> i64 {
-        i64::try_from(self.digits.len()).unwrap_or(i64::MAX)
-    }
-
-    /// The decimal exponent of the leading digit (0 for zero).
-    fn lead(&self) -> i64 {
-        if self.is_zero() { 0 } else { self.exp.saturating_add(self.len()).saturating_sub(1) }
-    }
-
-    /// Rounds to a multiple of `10^pos`, exact ties to even.
-    fn round_at(&self, pos: i64) -> Self {
-        let keep = self.exp.saturating_add(self.len()).saturating_sub(pos);
-        if keep >= self.len() {
-            return self.clone();
-        }
-        let Ok(keep) = usize::try_from(keep) else {
-            return Self::new(Vec::new(), 0);
-        };
-        let digit = self.digits.get(keep).copied().unwrap_or(0);
-        let sticky =
-            self.digits.get(keep.saturating_add(1)..).is_some_and(|r| r.iter().any(|&d| d != 0));
-        let mut kept = self.digits.get(..keep).unwrap_or_default().to_vec();
-        let odd = kept.last().is_some_and(|d| d % 2 == 1);
-        if digit > 5 || (digit == 5 && (sticky || odd)) {
-            let mut carry = true;
-            for d in kept.iter_mut().rev() {
-                if *d == 9 {
-                    *d = 0;
-                } else {
-                    *d = d.saturating_add(1);
-                    carry = false;
-                    break;
-                }
-            }
-            if carry {
-                kept.insert(0, 1);
-            }
-        }
-        Self::new(kept, pos)
-    }
-
-    fn ascii(&self) -> impl Iterator<Item = u8> + '_ {
-        self.digits.iter().map(|d| d.wrapping_add(b'0'))
-    }
-}
+/// Most fraction digits the exact decimal value of a double has (for 2^-1074); `%f` digits
+/// beyond them are zeros.
+const MAX_FRACTION_DIGITS: usize = 1074;
+/// Most significant digits the exact decimal value of a double has; `%e` digits beyond them are
+/// zeros.
+const MAX_SIGNIFICANT_DIGITS: usize = 767;
 
 // ---- output ---------------------------------------------------------------------------------
 
@@ -271,59 +130,27 @@ impl Pieces {
     }
 }
 
-/// `%f` digits of `d` with `prec` decimals: `(body, trailing zeros)`.
-fn fixed_digits(d: &Decimal, prec: usize, alt: bool) -> (Vec<u8>, usize) {
-    let p = i64::try_from(prec).unwrap_or(i64::MAX);
-    let r = d.round_at(p.saturating_neg());
-    let mut body = Vec::new();
-    let mut frac = Vec::new();
-    if r.is_zero() {
-        body.push(b'0');
-    } else if r.exp >= 0 {
-        body.extend(r.ascii());
-        body.resize(body.len().saturating_add(usize::try_from(r.exp).unwrap_or(0)), b'0');
-    } else {
-        let fd = usize::try_from(r.exp.unsigned_abs()).unwrap_or(usize::MAX);
-        let n = r.digits.len();
-        if n > fd {
-            let digits: Vec<u8> = r.ascii().collect();
-            let (int, f) = digits.split_at(n.saturating_sub(fd));
-            body.extend_from_slice(int);
-            frac.extend_from_slice(f);
-        } else {
-            body.push(b'0');
-            frac.resize(fd.saturating_sub(n), b'0');
-            frac.extend(r.ascii());
-        }
-    }
-    let trail = prec.saturating_sub(frac.len());
-    if prec > 0 || alt {
+/// `%f` digits of `|v|` (finite) with `prec` decimals: `(body, trailing zeros)`.
+fn fixed_digits(v: f64, prec: usize, alt: bool) -> (Vec<u8>, usize) {
+    let exact = prec.min(MAX_FRACTION_DIGITS);
+    let mut body = format!("{:.*}", exact, v.abs()).into_bytes();
+    if exact == 0 && alt {
         body.push(b'.');
     }
-    body.extend_from_slice(&frac);
-    (body, trail)
+    (body, prec.saturating_sub(exact))
 }
 
-/// `%e` digits of `d` with `prec` decimals: `(body, trailing zeros, decimal exponent)`.
-fn sci_digits(d: &Decimal, prec: usize, alt: bool) -> (Vec<u8>, usize, i64) {
-    let (r, x) = if d.is_zero() {
-        (d.clone(), 0)
-    } else {
-        let p = i64::try_from(prec).unwrap_or(i64::MAX);
-        let r = d.round_at(d.lead().saturating_sub(p));
-        let x = r.lead();
-        (r, x)
-    };
-    let mut body = Vec::new();
-    let mut digits = r.ascii();
-    body.push(digits.next().unwrap_or(b'0'));
-    if prec > 0 || alt {
+/// `%e` digits of `|v|` (finite) with `prec` decimals: `(body, trailing zeros, decimal
+/// exponent)`.
+fn sci_digits(v: f64, prec: usize, alt: bool) -> (Vec<u8>, usize, i64) {
+    let exact = prec.min(MAX_SIGNIFICANT_DIGITS);
+    let text = format!("{:.*e}", exact, v.abs());
+    let (mantissa, exp) = text.split_once('e').unwrap_or((&text, "0"));
+    let mut body = mantissa.as_bytes().to_vec();
+    if exact == 0 && alt {
         body.push(b'.');
     }
-    let rest: Vec<u8> = digits.collect();
-    let trail = prec.saturating_sub(rest.len());
-    body.extend_from_slice(&rest);
-    (body, trail, x)
+    (body, prec.saturating_sub(exact), exp.parse().unwrap_or(0))
 }
 
 fn exponent_suffix(x: i64, upper: bool) -> Vec<u8> {
@@ -358,28 +185,24 @@ pub(crate) fn fmt_float(sink: &mut Sink, v: f64, conv: u8, spec: &Spec) {
         p.emit(sink, spec, false);
         return;
     }
-    let d = Decimal::of(v);
     match conv.to_ascii_lowercase() {
         b'f' => {
-            (p.body, p.trail) = fixed_digits(&d, spec.prec.unwrap_or(6), spec.alt);
+            (p.body, p.trail) = fixed_digits(v, spec.prec.unwrap_or(6), spec.alt);
         }
         b'e' => {
-            let (body, trail, x) = sci_digits(&d, spec.prec.unwrap_or(6), spec.alt);
+            let (body, trail, x) = sci_digits(v, spec.prec.unwrap_or(6), spec.alt);
             (p.body, p.trail, p.suffix) = (body, trail, exponent_suffix(x, upper));
         }
         _ => {
             let prec = spec.prec.unwrap_or(6).max(1);
             let pi = i64::try_from(prec).unwrap_or(i64::MAX);
-            let x = if d.is_zero() {
-                0
-            } else {
-                d.round_at(d.lead().saturating_sub(pi.saturating_sub(1))).lead()
-            };
+            // The exponent after rounding to `prec` significant digits picks the style.
+            let (_, _, x) = sci_digits(v, prec.saturating_sub(1), false);
             if x < pi && x >= -4 {
                 let decimals = usize::try_from(pi.saturating_sub(1).saturating_sub(x)).unwrap_or(0);
-                (p.body, p.trail) = fixed_digits(&d, decimals, spec.alt);
+                (p.body, p.trail) = fixed_digits(v, decimals, spec.alt);
             } else {
-                let (body, trail, x) = sci_digits(&d, prec.saturating_sub(1), spec.alt);
+                let (body, trail, x) = sci_digits(v, prec.saturating_sub(1), spec.alt);
                 (p.body, p.trail, p.suffix) = (body, trail, exponent_suffix(x, upper));
             }
             if !spec.alt {
@@ -500,30 +323,6 @@ pub(crate) fn format_g(v: f64, prec: usize) -> Vec<u8> {
     let mut sink = Sink::new(usize::MAX);
     fmt_float(&mut sink, v, b'g', &Spec { prec: Some(prec), ..Spec::default() });
     sink.buf
-}
-
-/// The exact decimal value of a hexadecimal significand times a power of two, as a decimal
-/// string `digits e exp` that Rust's (correctly rounding) float parser accepts. `hex_digits` are
-/// hex digit values, `bin_exp` the binary exponent to apply.
-pub(crate) fn hex_to_decimal_string(hex_digits: &[u8], bin_exp: i64) -> String {
-    let mut big = Big::from_u64(0);
-    for &h in hex_digits {
-        big.mul_add(16, u32::from(h));
-    }
-    let d = if bin_exp >= 0 {
-        big.mul_pow2(u32::try_from(bin_exp).unwrap_or(u32::MAX));
-        Decimal::new(big.digits(), 0)
-    } else {
-        big.mul_pow5(u32::try_from(bin_exp.unsigned_abs()).unwrap_or(u32::MAX));
-        Decimal::new(big.digits(), bin_exp)
-    };
-    if d.is_zero() {
-        return "0".to_owned();
-    }
-    let mut s: String = d.ascii().map(char::from).collect();
-    s.push('e');
-    s.push_str(&d.exp.to_string());
-    s
 }
 
 /// FTE's `COM_QuotedString`: a string quoted so the console tokenizer reads it back as one
@@ -983,10 +782,21 @@ mod tests {
         assert_eq!(quote_string(b"abcdef", 6), b"\"abc\"");
     }
 
+    /// Digits beyond a double's exact decimal expansion are zeros, emitted without formatting
+    /// them first.
     #[test]
-    fn hex_decimal_strings() {
-        assert_eq!(hex_to_decimal_string(&[1], 4), "16e0");
-        assert_eq!(hex_to_decimal_string(&[1, 8], -4), "15e-1");
-        assert_eq!(hex_to_decimal_string(&[0], 4), "0");
+    fn huge_precisions() {
+        let f = format_f(0.5, 3000);
+        assert_eq!((&f[..3], f.len()), (&b"0.5"[..], 3002));
+        assert!(f[3..].iter().all(|&c| c == b'0'));
+        // 2^-1074 has exactly 1074 fraction digits, the last a 5.
+        let tiny = format_f(f64::from_bits(1), 1100);
+        assert_eq!((tiny.len(), tiny[1075]), (1102, b'5'));
+        assert!(tiny[1076..].iter().all(|&c| c == b'0'));
+        let e = format_e(1.0, 2000);
+        assert_eq!((&e[..2], &e[e.len() - 4..], e.len()), (&b"1."[..], &b"e+00"[..], 2006));
+        let mut s = Sink::new(10);
+        fmt_float(&mut s, 1.0, b'f', &Spec { prec: Some(usize::MAX), ..Spec::default() });
+        assert_eq!(s.buf, b"1.00000000");
     }
 }

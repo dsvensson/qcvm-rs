@@ -6,7 +6,7 @@
 use crate::builtins::Builtins;
 use crate::error::VmError;
 use crate::host::Host;
-use crate::stdlib::format::{format_f, hex_to_decimal_string};
+use crate::stdlib::format::format_f;
 use crate::stdlib::util::args_concat;
 use crate::vm::Vm;
 use crate::vm::num::{f2i, f2u};
@@ -281,9 +281,54 @@ fn parse_hex_float(s: &[u8]) -> Option<(f64, usize)> {
     } else if top < -1200 {
         0.0
     } else {
-        hex_to_decimal_string(&digits, scale).parse::<f64>().unwrap_or(0.0)
+        hex_digits_to_f64(&digits, scale)
     };
     Some((value, i))
+}
+
+/// The double nearest to `digits × 2^scale` (`digits` are hex digit values, most significant
+/// first, without leading zeros), exact ties to even, like C's `strtod`.
+fn hex_digits_to_f64(digits: &[u8], scale: i64) -> f64 {
+    // The first 64 bits, and whether any bit after them is set.
+    let mut m: u64 = 0;
+    let mut sticky = false;
+    let mut exp = scale;
+    for (k, &d) in digits.iter().enumerate() {
+        if k < 16 {
+            m = (m << 4) | u64::from(d);
+        } else {
+            sticky |= d != 0;
+            exp = exp.saturating_add(4);
+        }
+    }
+    if m == 0 {
+        return 0.0;
+    }
+    // Normalise so bit 63 is the leading one: the value is m × 2^exp (plus the sticky bits).
+    let lz = m.leading_zeros();
+    m <<= lz;
+    exp = exp.saturating_sub(i64::from(lz));
+    let lead = exp.saturating_add(63); // binary exponent of the leading bit
+    if lead > 1023 {
+        return f64::INFINITY;
+    }
+    // Bits to drop: 11 for a normal double (53 of 64 kept), more for a subnormal one.
+    let drop = 11i64.saturating_add((-1022i64).saturating_sub(lead).max(0));
+    if drop > 64 {
+        return 0.0;
+    }
+    let drop = u32::try_from(drop).unwrap_or(64);
+    let (kept, half, rest) = if drop == 64 {
+        (0, m >> 63 == 1, m << 1 != 0 || sticky)
+    } else {
+        let half = 1u64 << drop.wrapping_sub(1);
+        let dropped = m & (half << 1).wrapping_sub(1);
+        (m >> drop, dropped & half != 0, dropped & half.wrapping_sub(1) != 0 || sticky)
+    };
+    let kept = if half && (rest || kept & 1 == 1) { kept.saturating_add(1) } else { kept };
+    // `kept` has at most 54 bits and the scale puts it exactly on the double grid.
+    let shift = exp.saturating_add(i64::from(drop));
+    libm::ldexp(kept as f64, i32::try_from(shift).unwrap_or(i32::MAX))
 }
 
 /// C's `strtod` in the C locale: `(value, bytes consumed)`; nothing consumed means no number.
