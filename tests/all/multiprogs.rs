@@ -197,3 +197,150 @@ fn field_reserve_is_enforced() {
     assert_eq!(vm.num_progs(), 1);
     assert!(vm.field::<[f32; 3]>("extra0").is_err(), "failed add_progs leaves fields untouched");
 }
+
+/// Builtins use the globals of the progs that calls them: an add-on's `makevectors` writes the
+/// add-on's view vectors (which the main progs need not even define), and `changeyaw` turns the
+/// add-on's `self`.
+#[test]
+fn builtins_use_the_calling_progs_globals() {
+    let mut main = Asm::new();
+    main.global("self", ty::ENTITY, &[]);
+    for (name, t) in [("angles", ty::VECTOR), ("ideal_yaw", ty::FLOAT), ("yaw_speed", ty::FLOAT)] {
+        main.field(name, t);
+    }
+    let with_view = {
+        let mut asm = main.clone();
+        for v in ["v_forward", "v_right", "v_up"] {
+            asm.global(v, ty::VECTOR, &[0, 0, 0]);
+        }
+        asm
+    };
+    let mut addon = Asm::new();
+    let self_g = addon.global("self", ty::ENTITY, &[]);
+    addon.field("angles", ty::VECTOR);
+    for v in ["v_forward", "v_right", "v_up"] {
+        addon.global(v, ty::VECTOR, &[0, 0, 0]);
+    }
+    let target = addon.global("target", ty::ENTITY, &[]);
+    let mv = addon.builtin("makevectors", 1, 1);
+    let mv_g = addon.global("makevectors", ty::FUNCTION, &[mv]);
+    let cy = addon.builtin("changeyaw", 49, 0);
+    let cy_g = addon.global("changeyaw", ty::FUNCTION, &[cy]);
+    let yaw90 = addon.vector([0.0, 90.0, 0.0]);
+    addon.function("look", &[], 0);
+    addon.emit(Op::StoreV, yaw90, parm(0), 0);
+    addon.emit(Op::Call1, mv_g, 0, 0);
+    addon.emit(Op::Done, 0, 0, 0);
+    addon.function("turn", &[], 0);
+    addon.emit(Op::StoreEnt, target, self_g, 0);
+    addon.emit(Op::Call0, cy_g, 0, 0);
+    addon.emit(Op::Done, 0, 0, 0);
+
+    for main in [main, with_view] {
+        let mut vm: Vm<TestHost> = Vm::new(
+            load(&main),
+            Arc::new(Builtins::standard(Numbering::Csqc)),
+            VmConfig::default(),
+        )
+        .unwrap();
+        let mut host = TestHost::default();
+        let pr = vm.add_progs(&mut host, load(&addon)).unwrap();
+        let look = vm.find_function_in(pr, "look").unwrap();
+        vm.call(&mut host, look, &[]).unwrap();
+        let forward = vm.get(vm.global_in::<[f32; 3]>(pr, "v_forward").unwrap());
+        assert!((forward[1] - 1.0).abs() < 1e-6 && forward[0].abs() < 1e-6, "{forward:?}");
+        if let Ok(main_forward) = vm.global::<[f32; 3]>("v_forward") {
+            assert_eq!(vm.get(main_forward), [0.0; 3], "the main progs' vectors are untouched");
+        }
+
+        let e = vm.spawn().unwrap();
+        vm.set_field(e, vm.field::<f32>("ideal_yaw").unwrap(), 90.0);
+        vm.set_field(e, vm.field::<f32>("yaw_speed").unwrap(), 45.0);
+        let target = vm.global_in::<EntRef>(pr, "target").unwrap();
+        vm.set(target, e);
+        let turn = vm.find_function_in(pr, "turn").unwrap();
+        vm.call(&mut host, turn, &[]).unwrap();
+        let angles = vm.get_field(e, vm.field::<[f32; 3]>("angles").unwrap()).unwrap();
+        assert!((angles[1] - 45.0).abs() < 0.01, "{angles:?}");
+    }
+}
+
+/// The introspection builtins reach into other progs: `externcall`, `externvalue`, `externset`,
+/// `isfunction` and `callfunction`.
+#[test]
+fn extern_builtins_reach_other_progs() {
+    let mut main = main_progs();
+    for (name, number) in [
+        ("externcall", 201),
+        ("externvalue", 203),
+        ("externset", 204),
+        ("isfunction", 607),
+        ("callfunction", 605),
+    ] {
+        asm_builtin(&mut main, name, number);
+    }
+    let mut vm: Vm<TestHost> =
+        Vm::new(load(&main), Arc::new(Builtins::standard(Numbering::Csqc)), VmConfig::default())
+            .unwrap();
+    let mut host = TestHost::default();
+    let pr = vm.add_progs(&mut host, load(&addon_progs())).unwrap();
+    let (health, mana) = (vm.field::<f32>("health").unwrap(), vm.field::<f32>("mana").unwrap());
+    let e = vm.spawn().unwrap();
+    vm.set_field(e, health, 10.0);
+    vm.set_field(e, mana, 100.0);
+    let self_g = vm.global::<EntRef>("self").unwrap();
+    vm.set(self_g, e);
+    let mut call = |vm: &mut Vm<TestHost>, name: &str, args: &[Arg<'_>]| {
+        let f = vm.find_function(name).unwrap();
+        vm.call(&mut host, f, args).unwrap()
+    };
+
+    // externcall by progs number and in whichever progs has the function.
+    let r = call(
+        &mut vm,
+        "externcall",
+        &[Arg::Float(1.0), Arg::Bytes(b"addon_twice"), Arg::Float(3.0)],
+    );
+    assert_eq!(r.f32(), 116.0);
+    let r = call(
+        &mut vm,
+        "externcall",
+        &[Arg::Float(-2.0), Arg::Bytes(b"addon_twice"), Arg::Float(1.0)],
+    );
+    assert_eq!(r.f32(), 112.0);
+    let r = call(
+        &mut vm,
+        "externcall",
+        &[Arg::Float(1.0), Arg::Bytes(b"1:addon_twice"), Arg::Float(0.0)],
+    );
+    assert_eq!(r.f32(), 110.0, "an N: prefix selects the progs");
+
+    // externvalue reads another progs' globals (relocated strings included) or their addresses.
+    let r = call(&mut vm, "externvalue", &[Arg::Float(1.0), Arg::Bytes(b"greeting")]);
+    assert_eq!(vm.str(r.str_ref()), b"hello from the addon");
+    let r = call(&mut vm, "externvalue", &[Arg::Float(1.0), Arg::Bytes(b"thisprogs")]);
+    assert_eq!(r.f32(), 1.0);
+    let r = call(&mut vm, "externvalue", &[Arg::Float(0.0), Arg::Bytes(b"greeting")]);
+    assert_eq!(r.0[0], 0, "the main progs has no such global");
+    let r = call(&mut vm, "externvalue", &[Arg::Float(1.0), Arg::Bytes(b"addon_twice")]);
+    assert_eq!(r.func(), vm.find_function_in(pr, "addon_twice").unwrap(), "a function by name");
+
+    // externset writes them; `&name` gives an address QuakeC pointers can use.
+    call(&mut vm, "externset", &[Arg::Float(1.0), Arg::Float(42.0), Arg::Bytes(b"init_arg")]);
+    let init_arg = vm.global_in::<f32>(pr, "init_arg").unwrap();
+    assert_eq!(vm.get(init_arg), 42.0);
+    let r = call(&mut vm, "externvalue", &[Arg::Float(1.0), Arg::Bytes(b"&init_arg")]);
+    let bytes = vm.read_mem(qcvm::Ptr(r.0[0]), 4).unwrap();
+    assert_eq!(f32::from_le_bytes(bytes.try_into().unwrap()), 42.0);
+
+    // isfunction and callfunction search every progs.
+    assert_eq!(call(&mut vm, "isfunction", &[Arg::Bytes(b"addon_twice")]).f32(), 1.0);
+    assert_eq!(call(&mut vm, "isfunction", &[Arg::Bytes(b"nonexistent")]).f32(), 0.0);
+    let r = call(&mut vm, "callfunction", &[Arg::Float(4.0), Arg::Bytes(b"addon_twice")]);
+    assert_eq!(r.f32(), 118.0);
+}
+
+fn asm_builtin(asm: &mut Asm, name: &str, number: u32) {
+    let f = asm.builtin(name, number, -1);
+    asm.global(name, ty::FUNCTION, &[f]);
+}

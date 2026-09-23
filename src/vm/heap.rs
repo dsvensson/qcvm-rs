@@ -105,13 +105,6 @@ impl Heap {
         self.free(old);
         Some(new)
     }
-
-    /// Drops every block.
-    pub(crate) fn clear(&mut self) {
-        self.data.clear();
-        self.used.clear();
-        self.free.clear();
-    }
 }
 
 #[cfg(test)]

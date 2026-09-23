@@ -162,11 +162,6 @@ impl<H: Host> Builtins<H> {
     pub(crate) fn func(&self, slot: u32) -> Option<BuiltinFn<H>> {
         self.entries.get(usize::try_from(slot).ok()?).map(|e| e.func)
     }
-
-    /// The name registered in binding slot `slot`.
-    pub(crate) fn name(&self, slot: u32) -> Option<&[u8]> {
-        self.entries.get(usize::try_from(slot).ok()?).map(|e| &*e.name)
-    }
 }
 
 mod numbers;

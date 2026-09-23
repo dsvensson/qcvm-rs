@@ -34,17 +34,16 @@ pub(crate) struct Header {
     pub(crate) entity_fields: u32,
 }
 
-/// The eight extra fields of a version-7 header.
+/// The extra fields of a version-7 header that the loader uses (the header also holds the
+/// offsets of the file and type tables, which nothing needs, and the secondary version, which
+/// selects the [`ProgsFormat`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ExtHeader {
-    pub(crate) ofs_files: u32,
     pub(crate) ofs_linenums: u32,
     pub(crate) ofs_bodylessfuncs: u32,
     pub(crate) num_bodylessfuncs: u32,
-    pub(crate) ofs_types: u32,
     pub(crate) num_types: u32,
     pub(crate) blockscompressed: u32,
-    pub(crate) secondary_version: u32,
 }
 
 fn fields<const N: usize>(data: &[u8], start: usize) -> Result<[u32; N], LoadError> {
@@ -101,24 +100,21 @@ pub(crate) fn read_header(
         6 => Ok((header, None, ProgsFormat::V6)),
         7 => {
             let [
-                ofs_files,
+                _ofs_files,
                 ofs_linenums,
                 ofs_bodylessfuncs,
                 num_bodylessfuncs,
-                ofs_types,
+                _ofs_types,
                 num_types,
                 blockscompressed,
                 secondary_version,
             ] = fields::<8>(data, 60)?;
             let ext = ExtHeader {
-                ofs_files,
                 ofs_linenums,
                 ofs_bodylessfuncs,
                 num_bodylessfuncs,
-                ofs_types,
                 num_types,
                 blockscompressed,
-                secondary_version,
             };
             let format = match secondary_version {
                 FTE16_MAGIC => ProgsFormat::Fte16,

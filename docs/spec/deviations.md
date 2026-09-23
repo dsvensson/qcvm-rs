@@ -52,6 +52,25 @@ production code should leave them off.
 | Quake-charset encoder | cannot encode U+E00B (`\v`) | round-trips `\v` |
 | Fixed-size output buffers (`strtoupper`, `vtos`, …) | overflow on huge inputs | produce the full string, subject to the documented length caps |
 | `#0:gettime` | does not resolve in CSQC (engine name is `gettimef`) | resolves (alias) |
+| `strpad` with a negative pad shorter than the string | returns 4095 spaces (signed/unsigned mix-up) | returns the string unpadded |
+| `altstr_get`/`altstr_set` | count an escaped quote as a separator; `altstr_set` drops backslashes | honour escapes |
+| `chr2str`/`%c` with a code ≥ 2³¹ (UTF-8) | the encoder loops forever | encodes U+FFFD |
+| `\` at the very end of a `\"…` token | reads past the end of the string | ends the token |
+| 6-byte UTF-8 sequences | checks only four continuation bytes | requires all five |
+| Nested `` ^`u8: `` / `` =`k8: `` markup in `strdecolorize` | unbounded recursion | at most 16 levels |
+| `%I` in `sprintf` | passed through to the C library | a format error, like every other unknown conversion |
+| `bitshift` by 32 or more | count masked to 5 bits | everything is shifted out |
+| `memgetval`/`memsetval` | compute `ptr + ofs * 4` in floating point (wrong above 2²⁴) | exact integer arithmetic |
+| `memsetval` into a protected entity / at address 0 | writes | warns and skips / null-pointer error |
+| `memfree` of a pointer that is not a block start | ignored silently | warns |
+| `memcmp` offsets | the implementation swaps the two offset arguments | the 4th argument offsets the first pointer, as documented |
+| Reads from `createbuffer` buffers | cannot reach the last byte | can |
+| `json_parse` | decodes `\uXXXX` from its own output buffer; unbounded nesting | decodes from the input (low surrogates up to `DFFF`); at most 256 levels |
+| `buf_loadfile` | splits lines longer than 8191 bytes | keeps lines whole |
+| `bufstr_set`/`bufstr_add` beyond `Limits::string_buffer_entries` | accepts index 1,048,576 | refuses it with a warning (−1 from `bufstr_add`) |
+| `externcall` | passes on at most five argument slots | passes every remaining argument |
+| `findradius_list` | measures a different distance than `findradius` | the same test as `findradius` (distance to the box centre) |
+| `error` in developer mode | a warning | always fatal (`ErrorKind::QcError`) |
 
 ## Kept on purpose (FTE design choices)
 

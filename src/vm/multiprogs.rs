@@ -343,7 +343,6 @@ impl<H: Host> Vm<H> {
         let state = state_handles(&program, gbase_u32, &self.core.fields);
         self.core.progs.push(ProgsState {
             program: Arc::clone(&program),
-            sbase: sbase_u32,
             gbase: gbase_u32,
             callees,
             state,
@@ -394,5 +393,14 @@ impl<H: Host> Vm<H> {
         }
         let addr = def.offset.checked_mul(4).and_then(|o| o.checked_add(ps.gbase));
         Ok(crate::value::Global::new(addr.ok_or(super::LookupError::NotFound)?))
+    }
+
+    /// A typed handle to a global of the progs running now: inside a builtin, the progs of the
+    /// QuakeC code that called it (whose `self`, `v_forward`, … are the ones in use).
+    pub(crate) fn current_global<T: crate::value::QcValue>(
+        &self,
+        name: &str,
+    ) -> Result<crate::value::Global<T>, super::LookupError> {
+        self.global_in(PrNum(self.core.x.prnum), name)
     }
 }

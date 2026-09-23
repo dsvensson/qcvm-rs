@@ -92,12 +92,6 @@ impl Strings {
         }
     }
 
-    /// Drops every temp and interned string.
-    pub(crate) fn clear(&mut self) {
-        let (max_slots, max_bytes) = (self.max_slots, self.max_bytes);
-        *self = Self::new(max_slots, max_bytes);
-    }
-
     /// Number of live temp strings.
     pub(crate) fn live(&self) -> usize {
         self.live

@@ -184,9 +184,13 @@ fn concat(a: [Vec3; 3], b: [Vec3; 3]) -> [Vec3; 3] {
 
 // ---- globals ----------------------------------------------------------------------------------
 
+/// The calling progs' `v_forward`, `v_right` and `v_up`.
 fn view_globals<H: Host>(vm: &Vm<H>) -> Result<[Global<Vec3>; 3], VmError> {
-    match (vm.global::<Vec3>("v_forward"), vm.global::<Vec3>("v_right"), vm.global::<Vec3>("v_up"))
-    {
+    match (
+        vm.current_global::<Vec3>("v_forward"),
+        vm.current_global::<Vec3>("v_right"),
+        vm.current_global::<Vec3>("v_up"),
+    ) {
         (Ok(f), Ok(r), Ok(u)) => Ok([f, r, u]),
         _ => Err(VmError::new(ErrorKind::Host(
             "makevectors: one of v_forward, v_right or v_up was not defined".into(),
@@ -330,9 +334,10 @@ fn required_field(core: &Core, builtin: &str, name: &str) -> Result<u32, VmError
         .ok_or_else(|| VmError::builtin(format!("{builtin}: the progs has no .{name} field")))
 }
 
+/// The calling progs' `self`.
 fn self_entity<H: Host>(vm: &Vm<H>, builtin: &str) -> Result<u32, VmError> {
     let g = vm
-        .global::<EntRef>("self")
+        .current_global::<EntRef>("self")
         .map_err(|_| VmError::builtin(format!("{builtin}: the progs has no `self` global")))?;
     let e = vm.get(g).0;
     Ok(if e < vm.num_edicts() { e } else { 0 })

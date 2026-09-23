@@ -75,13 +75,69 @@ impl<H: Host> Builtins<H> {
 }
 
 /// FTE extensions whose builtins the standard library implements completely (what the default
-/// [`Host::check_extension`] reports).
-pub const EXTENSIONS: &[&str] = &[];
+/// [`Host::check_extension`] reports, together with [`DIGEST_EXTENSIONS`]).
+///
+/// Extensions that also need engine builtins (`FRIK_FILE`, `DP_QC_ENTITYDATA`, …) are not listed;
+/// a host that provides the rest should answer for them in its own
+/// [`Host::check_extension`].
+pub const EXTENSIONS: &[&str] = &[
+    "DP_QC_ASINACOSATANATAN2TAN",
+    "DP_QC_CHANGEPITCH",
+    "DP_QC_COPYENTITY",
+    "DP_QC_CRC16",
+    "DP_QC_CVAR_DEFSTRING",
+    "DP_QC_CVAR_STRING",
+    "DP_QC_CVAR_TYPE",
+    "DP_QC_EDICT_NUM",
+    "DP_QC_ETOS",
+    "DP_QC_FINDCHAIN",
+    "DP_QC_FINDCHAINFLAGS",
+    "DP_QC_FINDCHAINFLOAT",
+    "DP_QC_FINDFLAGS",
+    "DP_QC_FINDFLOAT",
+    "DP_QC_MINMAXBOUND",
+    "DP_QC_RANDOMVEC",
+    "DP_QC_SINCOSSQRTPOW",
+    "DP_QC_SPRINTF",
+    "DP_QC_STRFTIME",
+    "DP_QC_STRINGBUFFERS",
+    "DP_QC_STRINGCOLORFUNCTIONS",
+    "DP_QC_STRING_CASE_FUNCTIONS",
+    "DP_QC_STRREPLACE",
+    "DP_QC_TOKENIZEBYSEPARATOR",
+    "DP_QC_URI_ESCAPE",
+    "DP_QC_VECTOANGLES_WITH_ROLL",
+    "DP_QC_VECTORVECTORS",
+    "DP_REGISTERCVAR",
+    "DP_SV_PRINT",
+    "EXT_BITSHIFT",
+    "FTE_CALLTIMEOFDAY",
+    "FTE_MEMALLOC",
+    "FTE_MULTIPROGS",
+    "FTE_MULTITHREADED",
+    "FTE_QC_CHECKCOMMAND",
+    "FTE_QC_CROSSPRODUCT",
+    "FTE_QC_HASHTABLES",
+    "FTE_QC_INTCONV",
+    "FTE_STRINGS",
+    "ZQ_QC_STRINGS",
+];
 
-/// Whether `name` is one of [`EXTENSIONS`].
+/// Digest extensions, implemented with the `digests` feature.
+pub const DIGEST_EXTENSIONS: &[&str] = &[
+    "DP_QC_DIGEST_SHA256",
+    "FTE_QC_DIGEST_SHA1",
+    "FTE_QC_DIGEST_SHA224",
+    "FTE_QC_DIGEST_SHA384",
+    "FTE_QC_DIGEST_SHA512",
+];
+
+/// Whether `name` is one of [`EXTENSIONS`] (or, with the `digests` feature, one of
+/// [`DIGEST_EXTENSIONS`]).
 #[must_use]
 pub fn has_extension(name: &[u8]) -> bool {
-    EXTENSIONS.iter().any(|e| e.as_bytes() == name)
+    let digests: &[&str] = if cfg!(feature = "digests") { DIGEST_EXTENSIONS } else { &[] };
+    EXTENSIONS.iter().chain(digests).any(|e| e.as_bytes() == name)
 }
 
 /// The current UTC calendar time from the system clock.

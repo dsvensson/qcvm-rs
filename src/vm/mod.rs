@@ -2,6 +2,7 @@
 
 //! The virtual machine.
 
+mod autocvars;
 mod config;
 pub(crate) mod core;
 pub(crate) mod heap;
@@ -1096,14 +1097,7 @@ fn build_core<H: Host>(
         .collect::<Vec<_>>();
 
     let callees = bind(&program, builtins);
-    let progs = vec![ProgsState {
-        program,
-        sbase: 0,
-        gbase: gbase_u32,
-        callees,
-        state,
-        shared: Vec::new(),
-    }];
+    let progs = vec![ProgsState { program, gbase: gbase_u32, callees, state, shared: Vec::new() }];
 
     let mut core = Core {
         mem,

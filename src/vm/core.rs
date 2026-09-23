@@ -106,8 +106,6 @@ pub(crate) struct StateHandles {
 #[derive(Clone, Debug)]
 pub(crate) struct ProgsState {
     pub(crate) program: Arc<Program>,
-    /// Byte address of its string table.
-    pub(crate) sbase: u32,
     /// Byte address of its globals.
     pub(crate) gbase: u32,
     pub(crate) callees: Box<[Callee]>,

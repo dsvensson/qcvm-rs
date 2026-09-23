@@ -53,7 +53,9 @@ def extract(lines, defined):
             continue
         if line.startswith("#define") or not stack[-1]:
             continue
-        code = line.split("/*")[0].split("//")[0]
+        # Drop complete inline comments first (`void(.../*, string name*/) f = #605;`), then
+        # whatever starts a comment that runs on.
+        code = re.sub(r"/\*.*?\*/", " ", line).split("/*")[0].split("//")[0]
         for m in DECL.finditer(code):
             name, number, bound = m.group(1), int(m.group(2)), m.group(3)
             if number == 0:
@@ -88,7 +90,8 @@ def main():
         for name in sorted(named):
             out.append(f'    "{name}",')
         out.append("];")
-    sys.stdout.write("\n".join(out) + "\n")
+    # Bytes, so Windows does not turn the line feeds into CRLF.
+    sys.stdout.buffer.write(("\n".join(out) + "\n").encode("utf-8"))
 
 
 if __name__ == "__main__":

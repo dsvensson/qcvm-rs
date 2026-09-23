@@ -102,3 +102,35 @@ fn extensions_commands_and_flags() {
     assert_eq!(h.f("isserver", &[]), 0.0);
     assert_eq!(h.f("cvars_haveunsaved", &[]), 0.0);
 }
+
+/// `sync_autocvars` copies the host's cvars into `autocvar_*` globals, parsed by type; cvars the
+/// host lacks keep the progs' default, and syncing again picks up changes.
+#[test]
+fn autocvars_follow_the_hosts_cvars() {
+    let mut h = Harness::with(Numbering::Csqc, VmConfig::default(), |asm| {
+        asm.global("autocvar_f", ty::FLOAT, &[2.5f32.to_bits()]);
+        asm.global("autocvar_i", ty::INTEGER, &[3]);
+        asm.global("autocvar_v", ty::VECTOR, &[0, 0, 0]);
+        let dflt = asm.string("default");
+        asm.global("autocvar_s", ty::STRING, &[dflt]);
+        asm.global("autocvar_unset", ty::FLOAT, &[7.0f32.to_bits()]);
+    });
+    for (k, v) in [("f", "0.25x"), ("i", " -12abc"), ("v", "'1 2 3'"), ("s", "hello")] {
+        h.host.cvars.insert(k.as_bytes().to_vec(), v.as_bytes().to_vec());
+    }
+    h.vm.sync_autocvars(&mut h.host).unwrap();
+    let get_f = |h: &Harness, n: &str| h.vm.get(h.vm.global::<f32>(n).unwrap());
+    assert_eq!(get_f(&h, "autocvar_f"), 0.25);
+    assert_eq!(h.vm.get(h.vm.global::<i32>("autocvar_i").unwrap()), -12);
+    assert_eq!(h.vm.get(h.vm.global::<[f32; 3]>("autocvar_v").unwrap()), [1.0, 2.0, 3.0]);
+    let s_ref = h.vm.get(h.vm.global::<StrRef>("autocvar_s").unwrap());
+    assert_eq!(h.vm.str(s_ref), b"hello");
+    assert_eq!(get_f(&h, "autocvar_unset"), 7.0);
+    // A changed cvar is picked up by the next sync; the string survives collections.
+    h.host.cvars.insert(b"f".to_vec(), b"9".to_vec());
+    h.vm.sync_autocvars(&mut h.host).unwrap();
+    h.vm.collect_garbage().unwrap();
+    assert_eq!(get_f(&h, "autocvar_f"), 9.0);
+    let s_ref = h.vm.get(h.vm.global::<StrRef>("autocvar_s").unwrap());
+    assert_eq!(h.vm.str(s_ref), b"hello");
+}

@@ -11,7 +11,7 @@ use crate::error::{ErrorKind, VmError};
 use crate::host::{DumpKind, Host};
 use crate::progs::Type;
 use crate::stdlib::util::args_concat;
-use crate::value::{Arg, FuncRef, PrNum};
+use crate::value::{Arg, FuncRef};
 use crate::vm::Vm;
 use crate::vm::core::{Core, OFS_PARM0};
 
@@ -95,22 +95,7 @@ pub(crate) fn find_function_rt(core: &Core, prnum: i32, name: &[u8]) -> Option<F
 }
 
 fn find_in_progs(core: &Core, pr: usize, name: &[u8]) -> Option<FuncRef> {
-    let ps = core.progs.get(pr)?;
-    let index = *ps.program.functions_by_name.get(name)?;
-    let def = match ps.program.global_def_raw(name) {
-        Some(d) if d.ty == Type::Function => Some(d.ofs),
-        _ => ps
-            .program
-            .global_defs()
-            .find(|d| d.name == name && d.ty == Type::Function)
-            .map(|d| d.offset),
-    };
-    let pr = u8::try_from(pr).ok()?;
-    if let Some(ofs) = def {
-        let v = core.mem.g(core.global_offset(pr, ofs)?);
-        return (v != 0).then_some(FuncRef(v));
-    }
-    Some(FuncRef::new(PrNum(pr), index))
+    crate::vm::multiprogs::find_live_function(core, u8::try_from(pr).ok()?, name)
 }
 
 /// C `atoi` on a short prefix (for `N:name` function references).

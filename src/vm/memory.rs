@@ -217,12 +217,6 @@ impl Memory {
         self.set_g(off, v.to_bits());
     }
 
-    /// Reads a vector from region S.
-    #[inline(always)]
-    pub(crate) fn gv(&self, off: usize) -> [f32; 3] {
-        [self.gf(off), self.gf(off.wrapping_add(4)), self.gf(off.wrapping_add(8))]
-    }
-
     /// Writes a vector to region S, component by component.
     #[inline(always)]
     pub(crate) fn set_gv(&mut self, off: usize, v: [f32; 3]) {

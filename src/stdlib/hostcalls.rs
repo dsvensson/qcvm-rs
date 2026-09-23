@@ -82,7 +82,7 @@ pub fn error<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
 /// FTE's CSQC).
 pub fn objerror<H: Host>(vm: &mut Vm<H>, host: &mut H) -> Result<(), VmError> {
     let msg = args_concat(vm, 0);
-    if let Ok(g) = vm.global::<EntRef>("self") {
+    if let Ok(g) = vm.current_global::<EntRef>("self") {
         let e = vm.get(g).0;
         let e = if e < vm.num_edicts() { e } else { 0 };
         let mut text = format!("Entity {e}:\n").into_bytes();

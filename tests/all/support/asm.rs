@@ -283,13 +283,6 @@ impl Asm {
         f.locals = locals;
     }
 
-    /// Sets a function record's declared parameter count and sizes directly.
-    pub fn patch_params(&mut self, index: u32, num_parms: i32, sizes: [u8; 8]) {
-        let f = &mut self.functions[index as usize];
-        f.num_parms = num_parms;
-        f.parm_sizes = sizes;
-    }
-
     /// Emits a statement with raw operands and returns its index.
     pub fn emit(&mut self, op: Op, a: u32, b: u32, c: u32) -> u32 {
         self.emit_raw(op as u32, a, b, c)
