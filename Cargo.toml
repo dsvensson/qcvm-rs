@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "qcvm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "A re-entrant QuakeC virtual machine with full FTE opcode support and engine-free builtins"
+readme = "README.md"
+keywords = ["quake", "quakec", "csqc", "vm", "interpreter"]
+categories = ["game-development"]
+exclude = ["/scripts", "/tests/qc"]
+
+[features]
+default = ["digests"]
+# MD4/MD5/SHA1/SHA2 support for the `digest_hex`/`digest_ptr` builtins (CRC16 is always available).
+digests = ["dep:md4", "dep:md-5", "dep:sha1", "dep:sha2"]
+
+[dependencies]
+libm = "0.2.16"
+md-5 = { version = "0.11.0", optional = true }
+md4 = { version = "0.11.0", optional = true }
+sha1 = { version = "0.11.0", optional = true }
+sha2 = { version = "0.11.0", optional = true }
+
+[dev-dependencies]
+criterion = "0.8.2"
+proptest = "1.11.0"
+
+[[test]]
+name = "all"
+path = "tests/all/main.rs"
+
+[[bench]]
+name = "vm"
+harness = false
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+# The VM runs untrusted, server-supplied progs: library code must never panic.
+indexing_slicing = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+arithmetic_side_effects = "deny"
+
+[profile.test]
+overflow-checks = true
+
+[profile.bench]
+debug = "line-tables-only"

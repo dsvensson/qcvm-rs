@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+/target
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+*.dat
+*.lno
+!tests/qc/**/*.qc
