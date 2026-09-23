@@ -340,7 +340,7 @@ impl Asm {
         let header_len = if v7 { 92 } else { 60 };
         let mut out = vec![0u8; header_len];
 
-        let mut put = |out: &mut Vec<u8>, bytes: &[u8]| {
+        let put = |out: &mut Vec<u8>, bytes: &[u8]| {
             let ofs = out.len() as u32;
             out.extend_from_slice(bytes);
             ofs

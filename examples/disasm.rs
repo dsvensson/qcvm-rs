@@ -5,7 +5,12 @@
 //!
 //! Usage: `cargo run --example disasm -- progs.dat [--ops]`
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 
 use std::collections::BTreeMap;
 

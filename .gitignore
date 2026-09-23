@@ -6,3 +6,4 @@
 *.dat
 *.lno
 !tests/qc/**/*.qc
+/.claude/
