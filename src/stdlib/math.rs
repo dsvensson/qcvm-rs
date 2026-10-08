@@ -12,7 +12,7 @@ use crate::host::Host;
 use crate::vm::Vm;
 use crate::vm::num::f2i;
 
-use super::util::arg_int;
+use super::util::{arg_f64, arg_int, ret_u64};
 
 /// Registers this module's builtins.
 pub(crate) fn register<H: Host>(b: &mut Builtins<H>) {
@@ -41,6 +41,18 @@ pub(crate) fn register<H: Host>(b: &mut Builtins<H>) {
     b.set("anglesub", anglesub::<H>);
     b.set("random", random::<H>);
     b.set("randomvec", randomvec::<H>);
+    b.set("sind", sind::<H>);
+    b.set("cosd", cosd::<H>);
+    b.set("tand", tand::<H>);
+    b.set("acosd", acosd::<H>);
+    b.set("atand", atand::<H>);
+    b.set("atan2d", atan2d::<H>);
+    b.set("sqrtd", sqrtd::<H>);
+    b.set("powd", powd::<H>);
+    b.set("floord", floord::<H>);
+    b.set("ceild", ceild::<H>);
+    b.set("fabsd", fabsd::<H>);
+    b.set("logd", logd::<H>);
 }
 
 /// `(int)d` as x86 does it: truncation, with NaN and out-of-range values giving `i32::MIN`.
@@ -90,6 +102,62 @@ double_fn! {
     ceil => libm::ceil;
     /// `float fabs(float)`.
     fabs => libm::fabs;
+}
+
+macro_rules! double_fn_d {
+    ($($(#[$doc:meta])* $name:ident => $f:path;)*) => {$(
+        $(#[$doc])*
+        pub fn $name<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
+            let x = arg_f64(vm, 0);
+            ret_u64(vm, $f(x).to_bits());
+            Ok(())
+        }
+    )*};
+}
+
+double_fn_d! {
+    /// `__double sind(__double radians)`.
+    sind => libm::sin;
+    /// `__double cosd(__double radians)`.
+    cosd => libm::cos;
+    /// `__double tand(__double radians)`.
+    tand => libm::tan;
+    /// `__double acosd(__double)`, in radians.
+    acosd => libm::acos;
+    /// `__double atand(__double)`, in radians.
+    atand => libm::atan;
+    /// `__double sqrtd(__double)`.
+    sqrtd => libm::sqrt;
+    /// `__double floord(__double)`.
+    floord => libm::floor;
+    /// `__double ceild(__double)`.
+    ceild => libm::ceil;
+    /// `__double fabsd(__double)`.
+    fabsd => libm::fabs;
+}
+
+/// `__double atan2d(__double y, __double x)`, in radians.
+pub fn atan2d<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
+    let (y, x) = (arg_f64(vm, 0), arg_f64(vm, 1));
+    ret_u64(vm, libm::atan2(y, x).to_bits());
+    Ok(())
+}
+
+/// `__double powd(__double x, __double y)`.
+pub fn powd<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
+    let (x, y) = (arg_f64(vm, 0), arg_f64(vm, 1));
+    ret_u64(vm, libm::pow(x, y).to_bits());
+    Ok(())
+}
+
+/// `__double logd(__double v, optional __double base)`: `log` in double precision.
+pub fn logd<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
+    let mut r = libm::log(arg_f64(vm, 0));
+    if vm.argc() > 1 {
+        r /= libm::log(arg_f64(vm, 1));
+    }
+    ret_u64(vm, r.to_bits());
+    Ok(())
 }
 
 /// `float atan2(float y, float x)`, in radians.

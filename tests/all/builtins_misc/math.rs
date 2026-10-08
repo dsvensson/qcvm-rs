@@ -2,7 +2,7 @@
 
 //! Scalar maths and random numbers.
 
-use qcvm::{ErrorKind, Numbering, VmConfig};
+use qcvm::{Arg, ErrorKind, Numbering, VmConfig};
 
 use super::warnings;
 use crate::support::harness::{Harness, f};
@@ -124,6 +124,47 @@ fn logarithms() {
     assert_eq!(h.f("log", &[f(1000.0), f(10.0)]), 3.0);
     assert_eq!(h.f("logarithm", &[f(8.0), f(2.0)]), 3.0);
     assert_eq!(h.f("log", &[f(0.0)]), f32::NEG_INFINITY);
+}
+
+/// A double argument.
+fn d(x: f64) -> Arg<'static> {
+    let bits = x.to_bits();
+    Arg::Raw([bits as u32, (bits >> 32) as u32, 0])
+}
+
+/// Calls a builtin returning a double.
+fn call_d(h: &mut Harness, name: &str, args: &[Arg<'_>]) -> f64 {
+    let r = h.call(name, args).unwrap_or_else(|e| panic!("{name}: {e}"));
+    f64::from_bits(u64::from(r.0[0]) | (u64::from(r.0[1]) << 32))
+}
+
+#[test]
+fn double_variants_keep_double_precision() {
+    let names = &[
+        "sind", "cosd", "tand", "acosd", "atand", "atan2d", "sqrtd", "powd", "floord", "ceild",
+        "fabsd", "logd",
+    ];
+    let mut h = Harness::with(Numbering::Menu, VmConfig::default(), Harness::named(names));
+    for (name, x, want) in [
+        ("sind", 0.1, libm::sin(0.1)),
+        ("cosd", 0.1, libm::cos(0.1)),
+        ("tand", 0.1, libm::tan(0.1)),
+        ("acosd", 0.1, libm::acos(0.1)),
+        ("atand", 0.1, libm::atan(0.1)),
+        ("sqrtd", 2.0, std::f64::consts::SQRT_2),
+        ("floord", -1.5, -2.0),
+        ("ceild", 1.000_000_000_1, 2.0),
+        ("fabsd", -0.1, 0.1),
+        ("logd", std::f64::consts::E, 1.0),
+    ] {
+        assert_eq!(call_d(&mut h, name, &[d(x)]).to_bits(), want.to_bits(), "{name}({x})");
+    }
+    assert_eq!(call_d(&mut h, "fabsd", &[d(-0.0)]).to_bits(), 0);
+    assert_eq!(call_d(&mut h, "atan2d", &[d(1.0), d(1.0)]), std::f64::consts::FRAC_PI_4);
+    assert_eq!(call_d(&mut h, "powd", &[d(2.0), d(60.0)]), 1_152_921_504_606_846_976.0);
+    assert_eq!(call_d(&mut h, "logd", &[d(1024.0), d(2.0)]), 10.0);
+    assert_eq!(call_d(&mut h, "logd", &[d(0.0)]), f64::NEG_INFINITY);
+    assert!(call_d(&mut h, "acosd", &[d(2.0)]).is_nan());
 }
 
 #[test]

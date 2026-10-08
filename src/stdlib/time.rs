@@ -10,7 +10,7 @@ use crate::vm::Vm;
 use crate::vm::num::f2i;
 
 use super::introspect::find_function_rt;
-use super::util::opt_f32;
+use super::util::{opt_f32, ret_u64};
 
 /// Registers this module's builtins.
 pub(crate) fn register<H: Host>(b: &mut Builtins<H>) {
@@ -44,13 +44,8 @@ pub fn gettime<H: Host>(vm: &mut Vm<H>, host: &mut H) -> Result<(), VmError> {
 /// `__double gettimed(optional int type)`: like `gettime`, in double precision.
 pub fn gettimed<H: Host>(vm: &mut Vm<H>, host: &mut H) -> Result<(), VmError> {
     let t = if vm.argc() > 0 { vm.arg_i32(0) } else { 0 };
-    let bits = clock(vm, host, t).to_bits().to_le_bytes();
-    let word = |i: usize| {
-        u32::from_le_bytes(
-            bits.get(i..i.saturating_add(4)).and_then(|b| b.try_into().ok()).unwrap_or([0; 4]),
-        )
-    };
-    vm.ret_raw([word(0), word(4), 0]);
+    let v = clock(vm, host, t);
+    ret_u64(vm, v.to_bits());
     Ok(())
 }
 

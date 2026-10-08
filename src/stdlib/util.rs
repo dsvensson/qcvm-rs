@@ -62,6 +62,17 @@ pub(crate) fn arg_int<H: Host>(vm: &Vm<H>, i: usize) -> i32 {
     f2i(vm.arg_f32(i))
 }
 
+/// Argument `i` as a double (its first two words, low word first).
+pub(crate) fn arg_f64<H: Host>(vm: &Vm<H>, i: usize) -> f64 {
+    let [lo, hi, _] = vm.arg_raw(i);
+    f64::from_bits(u64::from(lo) | (u64::from(hi) << 32))
+}
+
+/// Returns a 64-bit value (a double's bits or a 64-bit integer) in the first two words.
+pub(crate) fn ret_u64<H: Host>(vm: &mut Vm<H>, bits: u64) {
+    vm.ret_raw([bits as u32, (bits >> 32) as u32, 0]);
+}
+
 /// Argument `i` as a float, or `default` if fewer arguments were passed.
 pub(crate) fn opt_f32<H: Host>(vm: &Vm<H>, i: usize, default: f32) -> f32 {
     if vm.argc() > i { vm.arg_f32(i) } else { default }

@@ -257,6 +257,11 @@ qcvm uses `e`.
 `fabs` compute in double and round to float. `rint`, `min`, `max`, `bound`, `mod`, `bitshift` and
 `log` are described in the [table](#numbered-builtins).
 
+`sind`, `cosd`, `tand`, `acosd`, `atand`, `atan2d(y, x)`, `sqrtd`, `powd`, `floord`, `ceild`,
+`fabsd` and `logd(v, optional base)` (`#0`, class A) are the same functions on doubles. They take
+and return `__double` without rounding to float. They are not in FTE's published source.
+QCQuake2's libc declares them for C's `<math.h>`.
+
 ### Random numbers
 
 The PRNG belongs to the VM (seedable, deterministic) and draws 15 bits at a time. `random` and
