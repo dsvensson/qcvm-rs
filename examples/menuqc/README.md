@@ -29,12 +29,16 @@ cargo run --release -p menuqc -- qcquake2.pk3 C:\Quake2\baseq2\pak0.pak C:\Quake
 ```
 
 ```text
-menuqc <qcquake.pk3> <pak0.pak> [more.pak ...] [--width N] [--height N] [-- quake args...]
+menuqc <qcquake.pk3> <pak0.pak> [more.pak ...] [--width N] [--height N] [--fps N]
+    [-- quake args...]
 ```
 
 - `--width`, `--height`: Quake's resolution (the `guest_width`/`guest_height` cvars). The default
   is 320×200, and the image is scaled to fit the window. Quake 2 starts at 320×240 and uses
   these only for a `sw_mode` outside its own list of modes.
+- `--fps`: the most frames a second the host draws. By default it draws them back to back, and
+  the games pace themselves. QCQuake renders at most 72 frames a second, and QCQuake2 at most
+  `cl_maxfps`. A timedemo runs flat out, so leave `--fps` off to measure one.
 - Anything after `--` goes to Quake's command line (the `guest_args` cvar), for example
   `-- +map e1m1` or `-- +timedemo demo1`.
 
@@ -54,7 +58,8 @@ captured for mouselook. Alt+Tab releases it.
 `menu_nq.dat` expects an FTE-style engine, and so does QCQuake2's `menu.dat`. The host:
 
 - **Entry points.** It calls `m_init` and then `m_toggle(1)`. The first `m_draw` runs Quake's
-  `main`, and every later `m_draw` runs a `Host_Frame`. The host ticks at 60 Hz. Key and mouse
+  `main`, and every later `m_draw` runs a `Host_Frame`. The host calls `m_draw` as often as it
+  can, or at the `--fps` rate. Key and mouse
   events go to `Menu_InputEvent` while the menu holds key focus (`setkeydest(2)`).
 - **Video.** Quake renders its 8-bit framebuffer and hands it over with
   `r_uploadimage("guestscreen", w, h, data, w*h+768, 15)`, which is the indices followed by the

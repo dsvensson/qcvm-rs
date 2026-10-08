@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! cargo run --release -p menuqc -- qcquake.pk3 path/to/id1/pak0.pak [more.pak ...]
-//!     [--width N] [--height N] [-- quake args...]
+//!     [--width N] [--height N] [--fps N] [-- quake args...]
 //! ```
 //!
 //! See README.md for where to get `qcquake.pk3`.
@@ -36,17 +36,12 @@ use crate::audio::Audio;
 use crate::host::{Draw, Image, KEY_MENU, MenuHost};
 
 const USAGE: &str = "usage: menuqc <qcquake.pk3> <pak0.pak> [more.pak ...] [--width N] \
-                     [--height N] [-- quake args...]";
+                     [--height N] [--fps N] [-- quake args...]";
 
 /// The progs to run from the pk3, by preference: QCQuake's NetQuake build (`menu_qwcl.dat` is
 /// QuakeWorld, which needs networking this host does not provide; its `menu.dat` is a loader that
 /// needs more builtins), else a lone `menu.dat` as in QCQuake2's pk3.
 const PROGS: [&str; 2] = ["menu_nq.dat", "menu.dat"];
-
-/// How often the host draws a frame. Quake skips frames that come less than 1/72 s after the
-/// last one, by a clock in whole milliseconds (`gettimed(1)`); 60 Hz clears that with margin, so
-/// Quake renders on every tick instead of an uneven every second or third.
-const TICK: Duration = Duration::from_micros(1_000_000 / 60);
 
 /// `Menu_InputEvent` event types.
 const KEY_DOWN: f32 = 0.0;
@@ -58,12 +53,14 @@ struct Options {
     paks: Vec<PathBuf>,
     width: Option<u32>,
     height: Option<u32>,
+    /// The most frames a second the host draws (`--fps`); none or 0 draws them back to back.
+    fps: Option<u32>,
     quake_args: Vec<String>,
 }
 
 fn parse_args() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
-    let (mut pk3, mut paks, mut width, mut height) = (None, Vec::new(), None, None);
+    let (mut pk3, mut paks, mut width, mut height, mut fps) = (None, Vec::new(), None, None, None);
     let mut quake_args = Vec::new();
     while let Some(arg) = args.next() {
         let mut number = |what: &str| {
@@ -73,13 +70,14 @@ fn parse_args() -> Result<Options, String> {
             "--" => quake_args.extend(args.by_ref()),
             "--width" => width = Some(number("--width")?),
             "--height" => height = Some(number("--height")?),
+            "--fps" => fps = Some(number("--fps")?),
             "-h" | "--help" => return Err(USAGE.to_owned()),
             _ if pk3.is_none() => pk3 = Some(PathBuf::from(arg)),
             _ => paks.push(PathBuf::from(arg)),
         }
     }
     match pk3 {
-        Some(pk3) if !paks.is_empty() => Ok(Options { pk3, paks, width, height, quake_args }),
+        Some(pk3) if !paks.is_empty() => Ok(Options { pk3, paks, width, height, fps, quake_args }),
         _ => Err(USAGE.to_owned()),
     }
 }
@@ -148,6 +146,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         input_event,
         time,
         window: None,
+        tick: opts.fps.filter(|&n| n > 0).map(|n| Duration::from_secs(1) / n),
         next_frame: Instant::now(),
         last_draws: Vec::new(),
         title: Vec::new(),
@@ -174,6 +173,10 @@ struct App {
     input_event: FuncRef,
     time: Option<Global<f32>>,
     window: Option<Screen>,
+    /// The time between frames with `--fps`. Without it the host draws frames back to back and
+    /// the games pace themselves: QCQuake renders at most 72 frames a second and QCQuake2 at most
+    /// `cl_maxfps`, except in timedemo, which runs flat out.
+    tick: Option<Duration>,
     next_frame: Instant,
     /// What the previous frame drew, for frames that draw nothing because QuakeC went to sleep
     /// halfway through `m_draw`.
@@ -372,12 +375,19 @@ impl ApplicationHandler for App {
             event_loop.exit();
             return;
         }
+        let Some(tick) = self.tick else {
+            if let Some(screen) = &self.window {
+                screen.window.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::Poll);
+            return;
+        };
         let now = Instant::now();
         if now >= self.next_frame {
             if let Some(screen) = &self.window {
                 screen.window.request_redraw();
             }
-            self.next_frame = (self.next_frame + TICK).max(now);
+            self.next_frame = (self.next_frame + tick).max(now);
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
     }
