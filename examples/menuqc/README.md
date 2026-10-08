@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
 # menuqc: Quake as menu QuakeC
 
 A small engine host, written against qcvm, that plays [QCQuake](https://fte.triptohell.info/):
