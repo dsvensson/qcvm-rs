@@ -2,9 +2,10 @@
 
 //! The host: engine state the builtins work on, the `Host` hooks, and the builtin registry.
 //!
-//! Only what `menu_nq.dat` uses is implemented: 2D drawing of uploaded images, key focus and
-//! cursor mode, files ([`crate::files`]) and sound ([`crate::audio`]). Everything else (memory,
-//! strings, `sprintf`, `sleep`, `gettimed`, ...) comes from qcvm's standard builtins.
+//! Only what QCQuake's `menu_nq.dat` and QCQuake2's `menu.dat` use is implemented: 2D drawing of
+//! uploaded images, key focus and cursor mode, files ([`crate::files`]) and sound
+//! ([`crate::audio`]). Everything else (memory, strings, `sprintf`, `sleep`, `gettimed`, ...) comes
+//! from qcvm's standard builtins.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -18,8 +19,10 @@ use crate::keys;
 
 type B = Result<(), VmError>;
 
-/// `r_uploadimage` format: 8-bit indices followed by a 768-byte RGB palette (FTE's TF_8PAL24).
+/// `r_uploadimage` formats: 8-bit indices followed by a 256-entry palette, RGB (FTE's TF_8PAL24,
+/// QCQuake) or RGBA with the alpha ignored (TF_8PAL32, QCQuake2).
 const FORMAT_8PAL24: i32 = 15;
+const FORMAT_8PAL32: i32 = 16;
 
 /// `setkeydest` value that sends key events to the menu.
 pub const KEY_MENU: f32 = 2.0;
@@ -123,26 +126,31 @@ fn r_uploadimage(vm: &mut Vm<MenuHost>, h: &mut MenuHost) -> B {
     let (w, ht) = (usize::try_from(vm.arg_i32(1)), usize::try_from(vm.arg_i32(2)));
     let size = usize::try_from(vm.arg_i32(4)).unwrap_or(0);
     let format = vm.arg_i32(5);
-    if format != FORMAT_8PAL24 {
-        vm.warn(format!("r_uploadimage: unsupported format {format}"));
-        return Ok(());
-    }
+    let entry = match format {
+        FORMAT_8PAL24 => 3,
+        FORMAT_8PAL32 => 4,
+        _ => {
+            vm.warn(format!("r_uploadimage: unsupported format {format}"));
+            return Ok(());
+        }
+    };
     let (Ok(width), Ok(height)) = (w, ht) else {
         vm.warn("r_uploadimage: bad size");
         return Ok(());
     };
     let count = width.saturating_mul(height);
-    if size < count.saturating_add(768) {
+    let total = count.saturating_add(256 * entry);
+    if size < total {
         vm.warn("r_uploadimage: data too small for its size");
         return Ok(());
     }
-    let Some(data) = vm.read_mem(vm.arg_ptr(3), count.saturating_add(768)) else {
+    let Some(data) = vm.read_mem(vm.arg_ptr(3), total) else {
         vm.warn("r_uploadimage: bad data pointer");
         return Ok(());
     };
     let (indices, palette) = data.split_at(count);
     let rgb = |i: u8| {
-        let at = usize::from(i) * 3;
+        let at = usize::from(i) * entry;
         match palette.get(at..at + 3) {
             Some(&[r, g, b]) => u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b),
             _ => 0,

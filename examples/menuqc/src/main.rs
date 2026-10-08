@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Runs QCQuake — WinQuake compiled to menu QuakeC — on qcvm, in a winit window.
+//! Runs QCQuake — WinQuake compiled to menu QuakeC — on qcvm, in a winit window. QCQuake2 (Quake 2
+//! built the same way) runs too.
 //!
 //! ```text
 //! cargo run --release -p menuqc -- qcquake.pk3 path/to/id1/pak0.pak [more.pak ...]
@@ -37,9 +38,10 @@ use crate::host::{Draw, Image, KEY_MENU, MenuHost};
 const USAGE: &str = "usage: menuqc <qcquake.pk3> <pak0.pak> [more.pak ...] [--width N] \
                      [--height N] [-- quake args...]";
 
-/// The progs inside the pk3: the NetQuake build (`menu_qwcl.dat` is QuakeWorld, which needs
-/// networking this host does not provide).
-const PROGS: &str = "menu_nq.dat";
+/// The progs to run from the pk3, by preference: QCQuake's NetQuake build (`menu_qwcl.dat` is
+/// QuakeWorld, which needs networking this host does not provide; its `menu.dat` is a loader that
+/// needs more builtins), else a lone `menu.dat` as in QCQuake2's pk3.
+const PROGS: [&str; 2] = ["menu_nq.dat", "menu.dat"];
 
 /// How often the host draws a frame. Quake skips frames that come less than 1/72 s after the
 /// last one, by a clock in whole milliseconds (`gettimed(1)`); 60 Hz clears that with margin, so
@@ -82,17 +84,19 @@ fn parse_args() -> Result<Options, String> {
     }
 }
 
-fn read_progs(pk3: &PathBuf) -> Result<Vec<u8>, Box<dyn Error>> {
+/// The name and contents of the first of [`PROGS`] in the pk3.
+fn read_progs(pk3: &PathBuf) -> Result<(&'static str, Vec<u8>), Box<dyn Error>> {
     let mut zip = zip::ZipArchive::new(std::fs::File::open(pk3)?)?;
-    let mut file = zip.by_name(PROGS).map_err(|e| format!("{}: {PROGS}: {e}", pk3.display()))?;
+    let name = PROGS.into_iter().find(|name| zip.index_for_name(name).is_some());
+    let name = name.ok_or_else(|| format!("{}: no {}", pk3.display(), PROGS.join(" or ")))?;
     let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
-    Ok(data)
+    zip.by_name(name)?.read_to_end(&mut data)?;
+    Ok((name, data))
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let opts = parse_args()?;
-    let progs = read_progs(&opts.pk3)?;
+    let (progs_name, progs) = read_progs(&opts.pk3)?;
 
     let audio = Audio::open();
     let builtins = Arc::new(host::builtins(audio.is_some()));
@@ -124,11 +128,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     vm.sync_autocvars(&mut host)?;
 
-    let func = |name: &str| vm.find_function(name).ok_or(format!("{PROGS} has no {name}"));
+    let func = |name: &str| vm.find_function(name).ok_or(format!("{progs_name} has no {name}"));
     let (m_init, m_toggle) = (func("m_init")?, func("m_toggle")?);
     let (m_draw, input_event) = (func("m_draw")?, func("Menu_InputEvent")?);
-    let time = vm.global::<f32>("time")?;
-    vm.set(time, vm.realtime() as f32);
+    // Like FTE, keep `time` up to date only if the progs has it as a float: in QCQuake2 it is
+    // libc's `time()`.
+    let time = vm.global::<f32>("time").ok();
+    if let Some(time) = time {
+        vm.set(time, vm.realtime() as f32);
+    }
     vm.call(&mut host, m_init, &[])?;
     // Show the "menu": the first `m_draw` after this starts Quake.
     vm.call(&mut host, m_toggle, &[Arg::Float(1.0)])?;
@@ -164,7 +172,7 @@ struct App {
     host: MenuHost,
     m_draw: FuncRef,
     input_event: FuncRef,
-    time: Global<f32>,
+    time: Option<Global<f32>>,
     window: Option<Screen>,
     next_frame: Instant,
     /// What the previous frame drew, for frames that draw nothing because QuakeC went to sleep
@@ -206,7 +214,9 @@ impl App {
 
         self.host.draws.clear();
         self.host.text.clear();
-        self.vm.set(self.time, self.vm.realtime() as f32);
+        if let Some(time) = self.time {
+            self.vm.set(time, self.vm.realtime() as f32);
+        }
         // Threads that slept (Quake's `usleep` while it waits for a key) continue first.
         let screensize = [size.width as f32, size.height as f32, 0.0];
         let result = self

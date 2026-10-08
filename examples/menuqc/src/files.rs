@@ -3,8 +3,8 @@
 //! An in-memory file system and FTE's file builtins (`fopen`, `fread`, `fseek64`, ...).
 //!
 //! The `.pak` files given on the command line are read-only; everything the progs writes
-//! (`config.cfg`, savegames) lives in memory until the program exits. The progs' libc has already
-//! reduced paths to game-relative ones (`./id1/pak0.pak` → `pak0.pak`).
+//! (`config.cfg`, savegames) lives in memory until the program exits. Paths are relative to the
+//! base game directory (`./id1/pak0.pak` and `./baseq2/pak0.pak` → `pak0.pak`).
 
 use std::collections::HashMap;
 
@@ -41,11 +41,19 @@ pub struct Vfs {
     next: i32,
 }
 
-/// Lowercase, forward slashes, no leading `./` or `/`.
+/// Base game directories, which are the root of this file system. QCQuake's libc strips `id1/`
+/// itself; QCQuake2's means to strip `baseq2/`, but its test is inverted, so the paths arrive
+/// with it.
+const GAME_DIRS: [&[u8]; 2] = [b"id1/", b"baseq2/"];
+
+/// Lowercase, forward slashes, no leading `./`, `/` or game directory.
 fn normalize(name: &[u8]) -> Vec<u8> {
     let mut n: Vec<u8> =
         name.iter().map(|&c| if c == b'\\' { b'/' } else { c.to_ascii_lowercase() }).collect();
     while let Some(rest) = n.strip_prefix(b"./").or_else(|| n.strip_prefix(b"/")) {
+        n = rest.to_vec();
+    }
+    if let Some(rest) = GAME_DIRS.iter().find_map(|dir| n.strip_prefix(*dir)) {
         n = rest.to_vec();
     }
     n
