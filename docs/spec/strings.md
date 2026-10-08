@@ -23,7 +23,7 @@ CSQC numbers; `#0` means the builtin is resolved by name. `strcmp` is `strncmp` 
 
 | Area | Builtins |
 |---|---|
-| Conversion | `ftos` 26, `vtos` 27, `etos` 65, `stof` 81, `stov` 117, `stoi` 259, `itos` 260, `stoh` 261, `htos` 262, `ftoi` #0, `itof` #0 |
+| Conversion | `ftos` 26, `vtos` 27, `etos` 65, `stof` 81, `stov` 117, `stoi` 259, `itos` 260, `stoh` 261, `htos` 262, `ftoi` #0, `itof` #0, and outside FTE, `stod` #0, `stol` #0, `stoul` #0 |
 | Formatting | `sprintf` 627 |
 | Length, substrings, characters | `strlen` 114, `strcat` 115, `substring` 116, `strzone` 118, `strunzone` 119, `strstrofs` 221, `str2chr` 222, `chr2str` 223 |
 | Case | `strconv` 224, `strtolower` 480, `strtoupper` 481 |
@@ -236,6 +236,32 @@ Start with (0, 0, 0) and skip one leading `'` if it is the first byte. Then, up 
 | `"(1 2 3)"` | (0, 0, 0) |
 | `"1e3 2 3"` | (1000, 2, 3) |
 | `"nan 1 2"` | (NaN, 1, 2) |
+
+### `stod`, `stol`, `stoul`
+
+These are not in FTE's published source. QCQuake2's libc declares them (`#0`) for `strtod`,
+`strtol` and `strtoul`, and qcvm gives them C's semantics:
+
+- `__double stod(string s, optional __out int used)`: `strtod`, the same parse as `stof` without
+  the rounding to float.
+- `__int64 stol(string s, int base, optional __out int used)`: `strtoll`. White space, a sign,
+  digits in `base` (2–36, letters in either case). Base 16 accepts a `0x` prefix. Base 0 picks 16
+  after `0x`, 8 after a leading `0`, and 10 otherwise. The result saturates at the 64-bit limits.
+  Any other base gives 0 and uses nothing.
+- `__uint64 stoul(string s, int base, optional __out int used)`: `strtoull`, parsed the same way.
+  A minus sign negates in unsigned arithmetic, and overflow gives 2⁶⁴ − 1.
+
+`used` receives the bytes the number took, as `endptr − s`. It is 0 when there is no number.
+
+| Call | Result | `used` |
+|---|---|---|
+| `stod("  12.5xyz")` | 12.5 | 6 |
+| `stol("  -12abc", 10i)` | −12 | 5 |
+| `stol("0x1f", 0i)` | 31 | 4 |
+| `stol("010", 0i)` | 8 | 3 |
+| `stol(" +", 10i)` | 0 | 0 |
+| `stol("99999999999999999999", 10i)` | 2⁶³ − 1 | 20 |
+| `stoul("-1", 10i)` | 2⁶⁴ − 1 | 2 |
 
 ## `sprintf`
 

@@ -260,7 +260,8 @@ qcvm uses `e`.
 `sind`, `cosd`, `tand`, `acosd`, `atand`, `atan2d(y, x)`, `sqrtd`, `powd`, `floord`, `ceild`,
 `fabsd` and `logd(v, optional base)` (`#0`, class A) are the same functions on doubles. They take
 and return `__double` without rounding to float. They are not in FTE's published source.
-QCQuake2's libc declares them for C's `<math.h>`.
+QCQuake2's libc declares them for C's `<math.h>`. The double conversions `stod`, `stol` and
+`stoul` are in [strings.md](strings.md#stod-stol-stoul).
 
 ### Random numbers
 

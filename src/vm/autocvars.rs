@@ -34,7 +34,7 @@ impl<H: Host> Vm<H> {
                 Type::Float => self.core.mem.set_gf(at, atof(&text) as f32),
                 Type::Integer | Type::UInt => {
                     // C's `atoi`: `strtol` truncated to `int`.
-                    self.core.mem.set_g(at, strtol(&text, 10) as u32);
+                    self.core.mem.set_g(at, strtol(&text, 10).0 as u32);
                 }
                 Type::Vector => self.core.mem.set_gv(at, parse_vector(&text)),
                 Type::String => {

@@ -41,7 +41,7 @@ use super::memory::heap_alloc;
 
 /// C's `atoi`: `strtol` in base 10, truncated to `int`.
 fn atoi(s: &[u8]) -> i32 {
-    strtol(s, 10) as i32
+    strtol(s, 10).0 as i32
 }
 
 /// Registers this module's builtins.

@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Number/string conversions: ftos, vtos, etos, itos, htos, stoi, stoh, ftoi, itof, ftou, utof,
-//! stof, stov (docs/spec/strings.md).
+//! Number/string conversions: ftos, vtos, etos, itos, htos, stoi, stoh, stod, stol, stoul, ftoi,
+//! itof, ftou, utof, stof, stov (docs/spec/strings.md).
 
 use crate::builtins::Builtins;
 use crate::error::VmError;
 use crate::host::Host;
 use crate::stdlib::format::format_f;
-use crate::stdlib::util::args_concat;
+use crate::stdlib::introspect::set_arg_word;
+use crate::stdlib::util::{args_concat, ret_u64};
 use crate::vm::Vm;
 use crate::vm::num::{f2i, f2u};
 
@@ -20,6 +21,9 @@ pub(crate) fn register<H: Host>(b: &mut Builtins<H>) {
     b.set("htos", htos::<H>);
     b.set("stoi", stoi::<H>);
     b.set("stoh", stoh::<H>);
+    b.set("stod", stod::<H>);
+    b.set("stol", stol::<H>);
+    b.set("stoul", stoul::<H>);
     b.set("ftoi", ftoi::<H>);
     b.set("itof", itof::<H>);
     b.set("ftou", ftou::<H>);
@@ -136,8 +140,9 @@ fn digit_value(c: u8) -> Option<u32> {
 
 /// The integer parse shared by C's `strtol` and `strtoul`: leading white space, a sign, an
 /// optional `0x` prefix (base 16, or base 0 which also picks octal for a leading `0`), digits.
-/// Returns `(negative, magnitude, overflowed)`.
-fn parse_c_integer(s: &[u8], base: u32) -> (bool, u64, bool) {
+/// Returns `(negative, magnitude, overflowed, end)`: `end` is the length of the number with its
+/// prefix, 0 without any digit (where C points `endptr` back at the start).
+fn parse_c_integer(s: &[u8], base: u32) -> (bool, u64, bool, usize) {
     let mut i = s.iter().take_while(|&&c| is_c_space(c)).count();
     let negative = match s.get(i) {
         Some(b'-') => {
@@ -164,38 +169,49 @@ fn parse_c_integer(s: &[u8], base: u32) -> (bool, u64, bool) {
     }
     let mut value = 0u64;
     let mut overflow = false;
+    let mut digits = 0usize;
     for &c in s.get(i..).unwrap_or_default() {
         let Some(d) = digit_value(c).filter(|&d| d < base) else { break };
         match value.checked_mul(u64::from(base)).and_then(|v| v.checked_add(u64::from(d))) {
             Some(v) => value = v,
             None => overflow = true,
         }
+        digits = digits.saturating_add(1);
     }
-    (negative, value, overflow)
+    let end = if digits == 0 { 0 } else { i.saturating_add(digits) };
+    (negative, value, overflow, end)
 }
 
-/// C's `strtol(s, NULL, base)` with a 64-bit `long` (saturating on overflow).
-pub(crate) fn strtol(s: &[u8], base: u32) -> i64 {
-    let (negative, mag, overflow) = parse_c_integer(s, base);
-    match (negative, overflow) {
+/// C's `strtol(s, &end, base)` with a 64-bit `long` (saturating on overflow): the value and the
+/// bytes it used.
+pub(crate) fn strtol(s: &[u8], base: u32) -> (i64, usize) {
+    let (negative, mag, overflow, end) = parse_c_integer(s, base);
+    let value = match (negative, overflow) {
         (false, true) => i64::MAX,
         (true, true) => i64::MIN,
         (false, false) => i64::try_from(mag).unwrap_or(i64::MAX),
         (true, false) => 0i64.checked_sub_unsigned(mag).unwrap_or(i64::MIN),
-    }
+    };
+    (value, end)
 }
 
-/// C's `strtoul(s, NULL, base)` with a 64-bit `long` (`ULONG_MAX` on overflow; a minus sign
-/// negates in unsigned arithmetic).
-pub(crate) fn strtoul(s: &[u8], base: u32) -> u64 {
-    let (negative, mag, overflow) = parse_c_integer(s, base);
-    if overflow {
+/// C's `strtoul(s, &end, base)` with a 64-bit `long` (`ULONG_MAX` on overflow; a minus sign
+/// negates in unsigned arithmetic): the value and the bytes it used.
+pub(crate) fn strtoul(s: &[u8], base: u32) -> (u64, usize) {
+    let (negative, mag, overflow, end) = parse_c_integer(s, base);
+    let value = if overflow {
         u64::MAX
     } else if negative {
         mag.wrapping_neg()
     } else {
         mag
-    }
+    };
+    (value, end)
+}
+
+/// The base argument of `stol`/`stoul`, if C accepts it (0 or 2–36).
+fn c_base<H: Host>(vm: &Vm<H>, i: usize) -> Option<u32> {
+    u32::try_from(vm.arg_i32(i)).ok().filter(|&b| b == 0 || (2..=36).contains(&b))
 }
 
 fn starts_with_ci(s: &[u8], prefix: &[u8]) -> bool {
@@ -449,7 +465,7 @@ pub(crate) fn atof(s: &[u8]) -> f64 {
 /// # Errors
 /// Never.
 pub fn stoi<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
-    let v = strtol(vm.arg_str(0), 0) as i32;
+    let v = strtol(vm.arg_str(0), 0).0 as i32;
     vm.ret_i32(v);
     Ok(())
 }
@@ -459,8 +475,48 @@ pub fn stoi<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
 /// # Errors
 /// Never.
 pub fn stoh<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
-    let v = strtoul(vm.arg_str(0), 16) as u32;
+    let v = strtoul(vm.arg_str(0), 16).0 as u32;
     vm.ret_raw([v, 0, 0]);
+    Ok(())
+}
+
+/// The bytes a conversion used, for its `__out int` parameter.
+fn used_word(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// `__double stod(string s, optional __out int used)`: C's `strtod`; `used` receives the bytes
+/// the number took (0 if there was none).
+///
+/// # Errors
+/// Never.
+pub fn stod<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
+    let (v, used) = strtod(vm.arg_str(0));
+    set_arg_word(vm, 1, used_word(used));
+    ret_u64(vm, v.to_bits());
+    Ok(())
+}
+
+/// `__int64 stol(string s, int base, optional __out int used)`: C's `strtoll` (base 0 or 2–36;
+/// another base gives 0 and uses nothing).
+///
+/// # Errors
+/// Never.
+pub fn stol<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
+    let (v, used) = c_base(vm, 1).map_or((0, 0), |base| strtol(vm.arg_str(0), base));
+    set_arg_word(vm, 2, used_word(used));
+    ret_u64(vm, v.cast_unsigned());
+    Ok(())
+}
+
+/// `__uint64 stoul(string s, int base, optional __out int used)`: C's `strtoull`, like `stol`.
+///
+/// # Errors
+/// Never.
+pub fn stoul<H: Host>(vm: &mut Vm<H>, _host: &mut H) -> Result<(), VmError> {
+    let (v, used) = c_base(vm, 1).map_or((0, 0), |base| strtoul(vm.arg_str(0), base));
+    set_arg_word(vm, 2, used_word(used));
+    ret_u64(vm, v);
     Ok(())
 }
 
@@ -609,17 +665,20 @@ mod tests {
 
     #[test]
     fn c_integers() {
-        assert_eq!(strtol(b"  -12abc", 0), -12);
-        assert_eq!(strtol(b"0x1f", 0), 31);
-        assert_eq!(strtol(b"010", 0), 8);
-        assert_eq!(strtol(b"08", 0), 0);
-        assert_eq!(strtol(b"0x", 0), 0);
-        assert_eq!(strtol(b"99999999999999999999", 10), i64::MAX);
-        assert_eq!(strtol(b"-99999999999999999999", 10), i64::MIN);
-        assert_eq!(strtol(b"-9223372036854775808", 10), i64::MIN);
-        assert_eq!(strtoul(b"-1", 16), u64::MAX);
-        assert_eq!(strtoul(b"0x1F", 16), 31);
-        assert_eq!(strtoul(b"1ffffffffffffffff", 16), u64::MAX);
+        assert_eq!(strtol(b"  -12abc", 0), (-12, 5));
+        assert_eq!(strtol(b"0x1f", 0), (31, 4));
+        assert_eq!(strtol(b"010", 0), (8, 3));
+        assert_eq!(strtol(b"08", 0), (0, 1));
+        assert_eq!(strtol(b"0x", 0), (0, 1));
+        assert_eq!(strtol(b"0xg", 16), (0, 1));
+        assert_eq!(strtol(b" -x", 10), (0, 0));
+        assert_eq!(strtol(b"zz", 36), (1295, 2));
+        assert_eq!(strtol(b"99999999999999999999", 10), (i64::MAX, 20));
+        assert_eq!(strtol(b"-99999999999999999999", 10), (i64::MIN, 21));
+        assert_eq!(strtol(b"-9223372036854775808", 10), (i64::MIN, 20));
+        assert_eq!(strtoul(b"-1", 16), (u64::MAX, 2));
+        assert_eq!(strtoul(b"0x1F", 16), (31, 4));
+        assert_eq!(strtoul(b"1ffffffffffffffff", 16), (u64::MAX, 17));
     }
 
     #[test]

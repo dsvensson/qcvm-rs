@@ -2,10 +2,11 @@
 
 //! Number ↔ string conversions (docs/spec/strings.md).
 
-use qcvm::{Arg, EntRef};
+use qcvm::{Arg, EntRef, Numbering, VmConfig};
 
 use super::{eq, harness};
-use crate::support::harness::{f, i, s, v};
+use crate::builtins_misc::parm_word;
+use crate::support::harness::{Harness, f, i, s, v};
 
 #[test]
 fn ftos_prints_the_exact_float() {
@@ -178,6 +179,52 @@ fn stof_is_c_atof() {
     // Double rounding like C: the decimal is rounded to double (1 + 2^-24, a float tie), then
     // to float (ties to even), not directly to float (which would round up).
     assert_eq!(h.f("stof", &[s("1.00000005960464477539062500001")]), 1.0);
+}
+
+/// Calls `name` and returns its 64-bit result and the byte count its `__out` parameter `out`
+/// received.
+fn call_wide(h: &mut Harness, name: &str, args: &[Arg<'_>], out: u32) -> (u64, u32) {
+    let r = h.call(name, args).unwrap_or_else(|e| panic!("{name}: {e}"));
+    (u64::from(r.0[0]) | (u64::from(r.0[1]) << 32), parm_word(h, out))
+}
+
+#[test]
+fn stod_stol_stoul_are_c_conversions_reporting_the_bytes_used() {
+    let names = &["stod", "stol", "stoul"];
+    let mut h = Harness::with(Numbering::Menu, VmConfig::default(), Harness::named(names));
+    let stod = |h: &mut Harness, text: &str| {
+        let (bits, used) = call_wide(h, "stod", &[s(text), i(-1)], 1);
+        (f64::from_bits(bits), used)
+    };
+    assert_eq!(stod(&mut h, "  12.5xyz"), (12.5, 6));
+    assert_eq!(stod(&mut h, "0.1"), (0.1, 3), "not rounded to float");
+    assert_eq!(stod(&mut h, "0x1.8p1"), (3.0, 7));
+    assert_eq!(stod(&mut h, "-Infinity!"), (f64::NEG_INFINITY, 9));
+    assert_eq!(stod(&mut h, "abc"), (0.0, 0));
+
+    let stol = |h: &mut Harness, text: &str, base: i32| {
+        let (bits, used) = call_wide(h, "stol", &[s(text), i(base), i(-1)], 2);
+        (bits.cast_signed(), used)
+    };
+    assert_eq!(stol(&mut h, "  -12abc", 10), (-12, 5));
+    assert_eq!(stol(&mut h, "0x1f", 0), (31, 4));
+    assert_eq!(stol(&mut h, "0x1f", 16), (31, 4));
+    assert_eq!(stol(&mut h, "010", 0), (8, 3));
+    assert_eq!(stol(&mut h, "zz", 36), (1295, 2));
+    assert_eq!(stol(&mut h, "8589934592", 10), (8_589_934_592, 10), "64 bits");
+    assert_eq!(stol(&mut h, "99999999999999999999", 10), (i64::MAX, 20));
+    assert_eq!(stol(&mut h, "-99999999999999999999", 10), (i64::MIN, 21));
+    assert_eq!(stol(&mut h, " +", 10), (0, 0));
+    for bad in [1, 37, -1] {
+        assert_eq!(stol(&mut h, "11", bad), (0, 0), "base {bad}");
+    }
+
+    let stoul = |h: &mut Harness, text: &str, base: i32| {
+        call_wide(h, "stoul", &[s(text), i(base), i(-1)], 2)
+    };
+    assert_eq!(stoul(&mut h, "ffffffffffffffff", 16), (u64::MAX, 16));
+    assert_eq!(stoul(&mut h, "-1", 10), (u64::MAX, 2));
+    assert_eq!(stoul(&mut h, "1ffffffffffffffff", 16), (u64::MAX, 17));
 }
 
 #[test]
