@@ -340,6 +340,25 @@ impl Memory {
         Ok(e)
     }
 
+    /// Takes slot `e` into use whether or not it is free or reserved, growing the table to reach
+    /// it. Fields are zeroed and the serial moves on, exactly as a spawn into that slot would.
+    pub(crate) fn claim(&mut self, e: u32) -> Result<(), ErrorKind> {
+        if e == 0 || e >= self.max_edicts {
+            return Err(ErrorKind::NoFreeEdicts);
+        }
+        if usize_from(e) >= self.slots.len() {
+            self.grow_to(e)?;
+        }
+        self.clear_entity(e);
+        if let Some(slot) = self.slots.get_mut(usize_from(e)) {
+            slot.in_use = true;
+            slot.protected = false;
+            slot.freetime = 0.0;
+            slot.serial = slot.serial.wrapping_add(1);
+        }
+        Ok(())
+    }
+
     /// Frees entity `e`, zeroing the given field words. `instant` makes the slot reusable at
     /// once.
     pub(crate) fn remove(

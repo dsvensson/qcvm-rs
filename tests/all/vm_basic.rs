@@ -373,6 +373,40 @@ fn entity_limits_and_reserved_slots() {
     assert!(no_free(vm.spawn()));
 }
 
+/// A reserved slot exists once claimed: in use, zeroed, a new serial, seen by the walks — and
+/// still never handed out by a spawn.
+#[test]
+fn a_reserved_slot_is_claimed_by_number() {
+    let mut asm = Asm::new();
+    asm.field("health", ty::FLOAT);
+    asm.function("noop", &[], 0);
+    asm.emit(Op::Done, 0, 0, 0);
+    let mut config = qcvm::VmConfig::ssqc();
+    config.limits.max_edicts = 16;
+    config.first_spawnable = 5;
+    let program =
+        std::sync::Arc::new(qcvm::Program::parse(&asm.build(qcvm::ProgsFormat::Fte16)).unwrap());
+    let mut vm: Vm<TestHost> =
+        Vm::new(program, std::sync::Arc::new(Builtins::empty(Numbering::None)), config).unwrap();
+    let health = vm.field::<f32>("health").unwrap();
+
+    vm.claim(EntRef(3)).unwrap();
+    assert!(vm.is_in_use(EntRef(3)));
+    assert!(!vm.is_in_use(EntRef(2)), "only the slot asked for");
+    assert_eq!(vm.serial(EntRef(3)), Some(1));
+    assert!(vm.entities().any(|e| e == EntRef(3)));
+    assert!(vm.set_field(EntRef(3), health, 50.0));
+    // Claiming again resets it.
+    vm.claim(EntRef(3)).unwrap();
+    assert_eq!(vm.get_field(EntRef(3), health), Some(0.0));
+    assert_eq!(vm.serial(EntRef(3)), Some(2));
+    // Spawns still skip the reservation.
+    assert_eq!(vm.spawn().unwrap(), EntRef(5));
+    // Neither the world nor anything past the limit.
+    assert!(vm.claim(EntRef(0)).is_err());
+    assert!(vm.claim(EntRef(16)).is_err());
+}
+
 /// Fields added by `ensure_field` get the value type's own definition type, so they can be
 /// looked up (and ensured again) with the same type.
 #[test]

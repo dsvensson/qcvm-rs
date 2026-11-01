@@ -790,6 +790,20 @@ impl<H: Host> Vm<H> {
         Ok(EntRef(e))
     }
 
+    /// Takes a particular slot into use, fields zeroed, the way a spawn into it would.
+    ///
+    /// For the slots [`VmConfig::first_spawnable`] reserves: a server's clients live there, and a
+    /// reserved slot is never handed out by [`Vm::spawn`], so it exists only once claimed. A slot
+    /// already in use is reset. Spawn defaults apply, as for a spawn.
+    ///
+    /// # Errors
+    /// [`ErrorKind::NoFreeEdicts`] for the world or a slot at or past [`Limits::max_edicts`].
+    pub fn claim(&mut self, e: EntRef) -> Result<(), VmError> {
+        self.core.mem.claim(e.0).map_err(VmError::from)?;
+        self.core.apply_spawn_defaults(e.0);
+        Ok(())
+    }
+
     /// Frees an entity. `instant` makes its slot reusable immediately.
     ///
     /// Only the configured fields ([`VmConfig::remove_clears`]) are zeroed; the others stay
